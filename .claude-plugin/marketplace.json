@@ -1,0 +1,15 @@
+{
+  "name": "telegram-paperplane",
+  "description": "Telegram for Claude Desktop and Cowork: your own account, the login in your Mac's Keychain.",
+  "owner": {
+    "name": "msff",
+    "url": "https://github.com/msff"
+  },
+  "plugins": [
+    {
+      "name": "telegram-paperplane",
+      "source": "./",
+      "description": "Connect your own Telegram account to Claude Desktop and Cowork, with the login in your macOS Keychain, plus a builder for your personal chat-search skill."
+    }
+  ]
+}

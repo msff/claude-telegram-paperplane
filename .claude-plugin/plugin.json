@@ -1,0 +1,20 @@
+{
+  "name": "telegram-paperplane",
+  "version": "0.1.0",
+  "description": "Connect your own Telegram account to Claude Desktop and Cowork: read and search chats, save drafts, send to Saved Messages and to bots you allowlist. The login stays in your macOS Keychain. Includes a builder for your personal chat-search skill.",
+  "author": {
+    "name": "msff",
+    "url": "https://github.com/msff"
+  },
+  "homepage": "https://github.com/msff/claude-telegram-paperplane",
+  "repository": "https://github.com/msff/claude-telegram-paperplane",
+  "license": "MIT",
+  "keywords": [
+    "telegram",
+    "cowork",
+    "claude-desktop",
+    "mcp",
+    "keychain",
+    "macos"
+  ]
+}
