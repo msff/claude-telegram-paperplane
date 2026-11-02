@@ -5,7 +5,10 @@
 #   bash setup.sh doctor      health check
 #   bash setup.sh bots        add bots the tg_bots connector may talk to
 #   bash setup.sh login       check the Telegram login (--again: new login, --phone: by phone number)
+#   bash setup.sh register    add the connectors to Claude Desktop (--code: also to Claude Code)
+#   bash setup.sh host on     run each connector once on this Mac, shared by every client (off, status)
 #   bash setup.sh uninstall   remove everything this installed
+#   bash setup.sh deploy DIR  copy the kit and the connector into DIR, nothing else (for your own setup)
 #
 # Installs into ~/.claude-telegram: the Telegram connector chigwell/telegram-mcp,
 # pinned to a reviewed commit, plus this kit's launcher. The Telegram login goes
@@ -24,12 +27,26 @@ step() { printf '\n\033[1m%s\033[0m\n' "$*"; }
 die()  { printf '✗ %s\n' "$*" >&2; exit 1; }
 yes_no() { local a; read -r -p "$1 " a; case "$a" in [Yy]*) return 0 ;; [Nn]*) return 1 ;; *) [ "${2:-n}" = y ] ;; esac; }
 helper() { "$PY" "$DEST/tgsetup.py" "$@"; }
+PROGRAM="setup.sh launch.sh serve.py bridge.py guard.py connectors.py tgsetup.py"
 
 [ "$(uname -s)" = Darwin ] || die "this setup is for macOS"
 
+# Run from an installed folder, every command works on that folder.
+if [ -f "$SRC/tgsetup.py" ] && [ -x "$SRC/chigwell/.venv/bin/python" ]; then
+  DEST="$SRC"
+  PY="$DEST/chigwell/.venv/bin/python"
+fi
+
+DEPLOY=""
 case "${1:-install}" in
   install) ;;
-  doctor|bots|login|register)
+  deploy)
+    [ -n "${2:-}" ] || die "usage: bash setup.sh deploy <folder>"
+    mkdir -p "$2"
+    DEST="$(cd "$2" && pwd)"
+    PY="$DEST/chigwell/.venv/bin/python"
+    DEPLOY=1 ;;
+  doctor|bots|login|register|host)
     [ -x "$PY" ] || die "not installed yet: run  bash setup.sh  from the setup folder first"
     cmd="$1"; shift
     helper "$cmd" "$@"
@@ -38,6 +55,7 @@ case "${1:-install}" in
   uninstall)
     yes_no "Remove Telegram for Claude from this Mac? [y/N]" || exit 0
     if [ -x "$PY" ]; then
+      helper host off --forget-tokens
       helper unregister
       if yes_no "Also end the Telegram login (recommended)? [Y/n]" y; then
         helper logout
@@ -68,12 +86,16 @@ if [ -z "$UV" ]; then
 fi
 echo "✓ macOS, Claude Desktop, git and uv are here"
 
-step "2/6  Copying the kit to ~/.claude-telegram"
+step "2/6  Copying the kit to ${DEST/#$HOME/~}"
 mkdir -p "$DEST/outbox"
 chmod 700 "$DEST" "$DEST/outbox"
 if [ "$SRC" != "$DEST" ]; then
-  for f in setup.sh launch.sh; do install -m 700 "$SRC/$f" "$DEST/$f"; done
-  for f in serve.py tgsetup.py README.md; do install -m 600 "$SRC/$f" "$DEST/$f"; done
+  for f in $PROGRAM; do
+    case "$f" in *.sh) mode=700 ;; *) mode=600 ;; esac
+    install -m "$mode" "$SRC/$f" "$DEST/$f"
+  done
+  # A deploy leaves the folder's own notes alone.
+  [ -n "$DEPLOY" ] || install -m 600 "$SRC/README.md" "$DEST/README.md"
 fi
 echo "✓ files in place"
 
@@ -92,6 +114,12 @@ fi
 (cd "$DEST/chigwell" && "$UV" sync --frozen --no-dev --quiet)
 [ -x "$PY" ] || die "the connector's Python environment was not created; see the messages above"
 echo "✓ connector ready"
+
+if [ -n "$DEPLOY" ]; then
+  step "Deployed to ${DEST/#$HOME/~}"
+  echo "Nothing was logged in or registered. Check it with:  bash ${DEST/#$HOME/~}/setup.sh doctor"
+  exit 0
+fi
 
 step "4/6  Logging in to Telegram"
 helper login
