@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +43,7 @@ OUTBOX = HERE / "outbox"
 SECRETS = ("api_id", "api_hash", "session", "user_id")
 FIRST_PORT = 47601
 READY_SECONDS = 90      # a hosted server opens its port only after it reaches Telegram
+UNLOAD_TRIES = 40       # quarter seconds to wait for launchd to let go of a booted-out agent
 _INIT = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "tg-doctor", "version": "1"}}
 
 API_HELP = """
@@ -515,8 +517,26 @@ def agent_loaded(label):
     return launchctl("print", f"gui/{os.getuid()}/{label}").returncode == 0
 
 
+def pause():
+    time.sleep(0.25)
+
+
+def unload_agent(label):
+    """Boot the agent out and wait until launchd has let go of it.
+
+    bootout returns before the job is gone, and a bootstrap in that window
+    fails with "5: Input/output error".
+    """
+    launchctl("bootout", f"gui/{os.getuid()}/{label}")
+    for _ in range(UNLOAD_TRIES):
+        if not agent_loaded(label):
+            return True
+        pause()
+    return False
+
+
 def drop_agent(s, c):
-    launchctl("bootout", f"gui/{os.getuid()}/{agent_label(s, c)}")
+    unload_agent(agent_label(s, c))
     agent_path(s, c).unlink(missing_ok=True)
 
 
@@ -547,6 +567,7 @@ def answers(s, c, wait=READY_SECONDS):
 
 
 def host_on(s, wait=READY_SECONDS):
+    """Start one agent per hosted connector. Returns the settings and the names that did not start."""
     raw = copy.deepcopy(s.raw)
     taken = {c.port for c in s.connectors.values() if c.port}
     for spec in raw["connectors"].values():
@@ -559,28 +580,34 @@ def host_on(s, wait=READY_SECONDS):
     LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
     (s.state / "logs").mkdir(parents=True, exist_ok=True)
     os.chmod(s.state / "logs", 0o700)
-    launched = []
+    launched, failed = [], []
     for c in hosted:
         why = startable(s, c)
         if why:
             drop_agent(s, c)
             print(f"  - {c.name} not hosted: {why}")
             continue
-        launched.append(c)
         if not kc_exists(s.token_item(c)):
             kc_write(s.token_item(c), secrets.token_urlsafe(32))
         agent_path(s, c).write_bytes(plistlib.dumps(agent_plist(s, c)))
-        launchctl("bootout", f"gui/{os.getuid()}/{agent_label(s, c)}")
+        if not unload_agent(agent_label(s, c)):
+            failed.append(c.name)
+            print(f"  ✗ {c.name}: launchd did not let go of the running agent")
+            continue
         done = launchctl("bootstrap", f"gui/{os.getuid()}", str(agent_path(s, c)))
         if done.returncode != 0:
+            failed.append(c.name)
             print(f"  ✗ {c.name}: launchd refused the agent ({done.stderr.strip()[:120]})")
+            continue
+        launched.append(c)
     for c in launched:
         try:
             answers(s, c, wait)
             print(f"  ✓ {c.name} answers on 127.0.0.1:{c.port}")
         except bridge.Unreachable as e:
+            failed.append(c.name)
             print(f"  ✗ {c.name}: {e} (log: {log_path(s, c)})")
-    return s
+    return s, failed
 
 
 def host_off(s, forget_tokens=False):
@@ -612,11 +639,15 @@ def cmd_host(args):
                   f"{'loaded' if loaded else 'not loaded'}, {'listening' if owned else 'not listening'}")
         return 0
     names = code_names(s)
-    s = host_on(s) if args.action == "on" else host_off(s, args.forget_tokens)
+    s, failed = host_on(s) if args.action == "on" else (host_off(s, args.forget_tokens), [])
     if names and claude_cli():
         done = sync_code(s, names)
         if done:
             print(f"✓ Claude Code: {', '.join(done)}")
+    if failed:
+        print(f"✗ Not running: {', '.join(failed)}. Don't restart Claude yet: run setup.sh doctor, "
+              "or setup.sh host off to go back.")
+        return len(failed)
     print(f"✓ Hosting is {'on' if s.hosted else 'off'}. Quit Claude Desktop (⌘Q) and reopen it to switch over.")
     return 0
 

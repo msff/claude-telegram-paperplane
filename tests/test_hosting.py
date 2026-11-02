@@ -19,10 +19,15 @@ L = str(tgsetup.LAUNCHER)
 
 
 class FakeMac:
-    """The Keychain, launchd and Claude Code's user config, held in memory."""
+    """The Keychain, launchd and Claude Code's user config, held in memory.
+
+    Like the real launchd, a booted-out job lingers for a few `print` calls
+    (`lag`), and a bootstrap of a job that is still there fails with error 5.
+    """
 
     def __init__(self, folder):
-        self.keychain, self.code, self.loaded = {}, {}, set()
+        self.keychain, self.code, self.loaded, self.leaving, self.silent = {}, {}, set(), {}, set()
+        self.lag, self.refuse = 0, False
         self.agents = Path(folder) / "LaunchAgents"
 
     def claude(self, *args):
@@ -34,10 +39,29 @@ class FakeMac:
 
     def launchctl(self, *args):
         if args[0] == "bootstrap":
-            self.loaded.add(plistlib.loads(Path(args[2]).read_bytes())["Label"])
+            label = plistlib.loads(Path(args[2]).read_bytes())["Label"]
+            if self.refuse or label in self.loaded or label in self.leaving:
+                return subprocess.CompletedProcess(args, 5, "", "Bootstrap failed: 5: Input/output error")
+            self.loaded.add(label)
         elif args[0] == "bootout":
-            self.loaded.discard(args[1].rsplit("/", 1)[1])
+            label = args[1].rsplit("/", 1)[1]
+            if label in self.loaded and self.lag:
+                self.leaving[label] = self.lag
+            self.loaded.discard(label)
+        elif args[0] == "print":
+            label = args[1].rsplit("/", 1)[1]
+            if label in self.leaving:
+                self.leaving[label] -= 1
+                if not self.leaving[label]:
+                    del self.leaving[label]
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 0 if label in self.loaded else 113, "", "")
         return subprocess.CompletedProcess(args, 0, "", "")
+
+    def answers(self, s, c, wait=0):
+        if c.name in self.silent:
+            raise tgsetup.bridge.Unreachable("is not running")
+        return {"result": {}}
 
     def patches(self, settings):
         conf = mock.MagicMock(return_value=settings)
@@ -46,7 +70,7 @@ class FakeMac:
             "claude": self.claude, "claude_cli": lambda: "claude", "code_servers": lambda: dict(self.code),
             "kc_exists": lambda n: n in self.keychain, "kc_read": self.keychain.get,
             "kc_write": self.keychain.__setitem__, "kc_delete": lambda n: self.keychain.pop(n, None),
-            "answers": lambda s, c, wait=0: {"result": {}},
+            "answers": self.answers, "pause": lambda: None,
         }.items()]
 
 
@@ -69,12 +93,14 @@ class HostingTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def host(self, action, forget_tokens=False):
+        out = io.StringIO()
         with contextlib.ExitStack() as stack:
             for p in self.mac.patches(self.settings):
                 stack.enter_context(p)
-            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
-            tgsetup.cmd_host(argparse.Namespace(action=action, forget_tokens=forget_tokens))
+            stack.enter_context(contextlib.redirect_stdout(out))
+            result = tgsetup.cmd_host(argparse.Namespace(action=action, forget_tokens=forget_tokens))
         self.settings = connectors.load(self.settings.home / "settings.json")
+        return result, out.getvalue()
 
     def agent(self, name):
         return self.mac.agents / f"{tgsetup.agent_label(self.settings, self.settings.connector(name))}.plist"
@@ -112,6 +138,28 @@ class HostingTest(unittest.TestCase):
         self.host("off", forget_tokens=True)
         self.assertEqual(list(self.mac.agents.glob("*.plist")), [])
         self.assertEqual(self.mac.keychain, {})
+
+    def test_host_on_again_restarts_running_agents(self):
+        self.host("on")
+        self.mac.lag = 3
+        result, out = self.host("on")
+        self.assertEqual(result, 0)
+        self.assertEqual(len(self.mac.loaded), 3)
+        self.assertNotIn("✗", out)
+
+    def test_host_on_reports_agents_launchd_refuses_and_fails(self):
+        self.mac.refuse = True
+        result, out = self.host("on")
+        self.assertEqual(result, 3)
+        self.assertIn("launchd refused", out)
+        self.assertNotIn("Hosting is on", out)
+
+    def test_host_on_reports_a_connector_that_does_not_answer(self):
+        self.mac.silent.add("tg_saved")
+        result, out = self.host("on")
+        self.assertEqual(result, 1)
+        self.assertIn("tg_saved", out.split("✗", 1)[1])
+        self.assertNotIn("Hosting is on", out)
 
     def test_connector_without_bots_is_not_hosted(self):
         (self.settings.home / "bots.txt").write_text("# none yet\n")
