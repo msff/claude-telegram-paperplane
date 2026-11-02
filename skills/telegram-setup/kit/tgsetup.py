@@ -35,14 +35,13 @@ CODE_CONFIG = Path.home() / ".claude.json"
 CODE_SETTINGS = Path.home() / ".claude" / "settings.json"
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 PIN = "9760717c2bb6a5caae90267b0fc3f7e8a12c95ce"
-SECURITY = "/usr/bin/security"
+SECURITY = connectors.SECURITY
 LAUNCHER = HERE / "launch.sh"
 BOTS = HERE / "bots.txt"
 OUTBOX = HERE / "outbox"
 SECRETS = ("api_id", "api_hash", "session", "user_id")
 FIRST_PORT = 47601
 READY_SECONDS = 90      # a hosted server opens its port only after it reaches Telegram
-_SAFE = re.compile(r"^[A-Za-z0-9_=+/.\-]+$")
 _INIT = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "tg-doctor", "version": "1"}}
 
 API_HELP = """
@@ -85,7 +84,7 @@ def kc_exists(name):
 def kc_write(name, value):
     # `security -i` splits its input on whitespace and quotes; these values never contain either.
     service = conf().service
-    if not (_SAFE.match(name) and _SAFE.match(value)):
+    if not (connectors.ITEM.match(name) and connectors.ITEM.match(value)):
         sys.exit(f"✗ refusing to store '{name}': unexpected characters")
     subprocess.run([SECURITY, "-i"], capture_output=True, text=True, timeout=10,
                    input=f"add-generic-password -U -s {service} -a {name} -l {service} -w {value}\n")
@@ -276,14 +275,17 @@ async def cmd_bots(args):
 
 # ---------- Settings ----------
 
-def save_settings(s, raw):
-    """Write the install's settings.json atomically and return the settings it now holds."""
-    path = s.home / "settings.json"
-    fd, tmp = tempfile.mkstemp(dir=s.home, prefix=".settings.")
+def write_json(path, data, **dump):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(raw, f, indent=2)
+        json.dump(data, f, indent=2, **dump)
         f.write("\n")
     os.replace(tmp, path)
+
+
+def save_settings(s, raw):
+    path = s.home / "settings.json"
+    write_json(path, raw)
     conf.cache_clear()
     return connectors.load(path)
 
@@ -327,11 +329,7 @@ def save_config(cfg):
         backup = DESKTOP_CONFIG.with_name(f"{DESKTOP_CONFIG.name}.bak-{datetime.now():%Y%m%d-%H%M%S}")
         backup.write_bytes(DESKTOP_CONFIG.read_bytes())
         os.chmod(backup, 0o600)
-    fd, tmp = tempfile.mkstemp(dir=DESKTOP_CONFIG.parent, prefix=".claude_desktop_config.")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, DESKTOP_CONFIG)
+    write_json(DESKTOP_CONFIG, cfg, ensure_ascii=False)
 
 
 def code_servers():
@@ -348,7 +346,7 @@ def desktop_entry(c):
 
 
 def code_entry(s, c):
-    if s.hosted and c.port:
+    if s.serves(c):
         return {"type": "http", "url": s.url(c), "headersHelper": f"{shlex.quote(str(LAUNCHER))} --headers"}
     return {"type": "stdio", "command": str(LAUNCHER), "args": [c.name], "env": {}}
 
@@ -497,9 +495,13 @@ def agent_path(s, c):
     return LAUNCH_AGENTS / f"{agent_label(s, c)}.plist"
 
 
+def log_path(s, c):
+    return s.state / "logs" / f"{c.name}.log"
+
+
 def agent_plist(s, c):
     """The launchd job for one hosted connector. It holds no secret: the server reads the Keychain itself."""
-    log = str(s.state / "logs" / f"{c.name}.log")
+    log = str(log_path(s, c))
     return {"Label": agent_label(s, c), "ProgramArguments": [str(LAUNCHER), c.name, "--host"],
             "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
             "WorkingDirectory": str(s.state), "StandardOutPath": log, "StandardErrorPath": log}
@@ -511,6 +513,11 @@ def launchctl(*args):
 
 def agent_loaded(label):
     return launchctl("print", f"gui/{os.getuid()}/{label}").returncode == 0
+
+
+def drop_agent(s, c):
+    launchctl("bootout", f"gui/{os.getuid()}/{agent_label(s, c)}")
+    agent_path(s, c).unlink(missing_ok=True)
 
 
 def port_free(port):
@@ -526,7 +533,7 @@ def pick_port(taken, start=FIRST_PORT):
     for port in range(start, 65536):
         if port not in taken and port_free(port):
             return port
-    sys.exit("✗ no free port above 47601")
+    sys.exit(f"✗ no free port from {start} up")
 
 
 def answers(s, c, wait=READY_SECONDS):
@@ -552,13 +559,14 @@ def host_on(s, wait=READY_SECONDS):
     LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
     (s.state / "logs").mkdir(parents=True, exist_ok=True)
     os.chmod(s.state / "logs", 0o700)
+    launched = []
     for c in hosted:
         why = startable(s, c)
         if why:
-            launchctl("bootout", f"gui/{os.getuid()}/{agent_label(s, c)}")
-            agent_path(s, c).unlink(missing_ok=True)
+            drop_agent(s, c)
             print(f"  - {c.name} not hosted: {why}")
             continue
+        launched.append(c)
         if not kc_exists(s.token_item(c)):
             kc_write(s.token_item(c), secrets.token_urlsafe(32))
         agent_path(s, c).write_bytes(plistlib.dumps(agent_plist(s, c)))
@@ -566,20 +574,18 @@ def host_on(s, wait=READY_SECONDS):
         done = launchctl("bootstrap", f"gui/{os.getuid()}", str(agent_path(s, c)))
         if done.returncode != 0:
             print(f"  ✗ {c.name}: launchd refused the agent ({done.stderr.strip()[:120]})")
-    for c in hosted:
-        if startable(s, c) is None:
-            try:
-                answers(s, c, wait)
-                print(f"  ✓ {c.name} answers on 127.0.0.1:{c.port}")
-            except bridge.Unreachable as e:
-                print(f"  ✗ {c.name}: {e} (log: {s.state / 'logs' / (c.name + '.log')})")
+    for c in launched:
+        try:
+            answers(s, c, wait)
+            print(f"  ✓ {c.name} answers on 127.0.0.1:{c.port}")
+        except bridge.Unreachable as e:
+            print(f"  ✗ {c.name}: {e} (log: {log_path(s, c)})")
     return s
 
 
 def host_off(s, forget_tokens=False):
     for c in s.connectors.values():
-        launchctl("bootout", f"gui/{os.getuid()}/{agent_label(s, c)}")
-        agent_path(s, c).unlink(missing_ok=True)
+        drop_agent(s, c)
         if forget_tokens:
             kc_delete(s.token_item(c))
     raw = copy.deepcopy(s.raw)
@@ -635,7 +641,7 @@ def clash_problems(s, desktop, code):
         stdio = {"command": str(LAUNCHER), "args": [name]}
         d_ok = same(d, stdio)
         cc_ok = same(cc, {"type": "stdio", **stdio}) or (
-            c is not None and s.hosted and c.port and cc.get("type") == "http" and ours(cc)
+            c is not None and s.serves(c) and cc.get("type") == "http" and ours(cc)
             and cc.get("url") == s.url(c))
         if d_ok and cc_ok:
             continue
@@ -827,7 +833,7 @@ async def cmd_doctor(args):
             if not agent_loaded(agent_label(s, c)):
                 bad(f"{c.name}: launchd agent not loaded: run setup.sh host on")
             elif not bridge.listener_owned(c.port):
-                bad(f"{c.name}: nothing of yours listens on port {c.port} (log: {s.state / 'logs' / (c.name + '.log')})")
+                bad(f"{c.name}: nothing of yours listens on port {c.port} (log: {log_path(s, c)})")
             elif "code" in c.clients and not headers_released(s, c):
                 bad(f"{c.name}: the headers helper gives Claude Code no token")
             else:

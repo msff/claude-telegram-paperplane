@@ -3,7 +3,7 @@
 Desktop's config only starts stdio commands, so when hosting is on the launcher
 runs this instead of a second Telegram server: each JSON-RPC line from stdin is
 POSTed to the hosted connector and each reply goes back as one stdout line.
-Standard library only, so a bridge stays near 16 MB.
+Standard library only, so a bridge stays small.
 """
 import http.client
 import json
@@ -154,8 +154,8 @@ class Bridge:
             self.out.flush()
 
 
-def run(settings, connector):
+def run(settings, c):
     """Relay stdin and stdout to this install's hosted copy of the connector."""
-    token = kc_read(settings.service, settings.token_item(connector))
-    Bridge(connector.name, settings.url(connector), token,
+    token = kc_read(settings.service, settings.token_item(c))
+    Bridge(c.name, settings.url(c), token,
            doctor=f"'{settings.home}/setup.sh doctor'").run()

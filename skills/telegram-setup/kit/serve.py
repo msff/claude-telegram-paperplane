@@ -70,7 +70,7 @@ def headers(settings, env, owned=bridge.listener_owned, read=kc_read, wait=HEADE
     """
     name = env.get("CLAUDE_CODE_MCP_SERVER_NAME", "")
     c = settings.connectors.get(name)
-    if c is None or not settings.hosted or not c.port:
+    if c is None or not settings.serves(c):
         raise Refused(f"'{name}' is not a hosted connector of this install")
     if env.get("CLAUDE_CODE_MCP_SERVER_URL") != settings.url(c):
         raise Refused(f"{name}: the URL Claude Code asked for is not {settings.url(c)}")
@@ -361,7 +361,6 @@ def serve(allow, token=None, port=0, connector=CONNECTOR):
 
 
 def trim_log(limit=LOG_LIMIT):
-    """Start the hosted server's log afresh once it has grown past the limit."""
     try:
         st = os.fstat(2)
         if stat.S_ISREG(st.st_mode) and st.st_size > limit:
@@ -380,7 +379,7 @@ def main(argv=None):
         c = settings.connector(name)
     except SettingsError as e:
         raise Refused(str(e)) from None
-    if mode == "run" and settings.hosted and c.port:
+    if mode == "run" and settings.serves(c):
         return bridge.run(settings, c)
     token = None
     if mode == "host":

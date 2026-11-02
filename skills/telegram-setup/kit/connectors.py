@@ -61,8 +61,9 @@ DEFAULTS = {
     "connectors": {"tg_main": {"role": "read"}, "tg_saved": {"role": "saved"}, "tg_bots": {"role": "bots"}},
 }
 _NAME = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
-_ITEM = re.compile(r"^[A-Za-z0-9_=+/.\-]+$")
-_KEYS = {"role", "session", "device", "user_id", "expected_username", "data", "allow_file", "files", "clients", "port"}
+ITEM = re.compile(r"^[A-Za-z0-9_=+/.\-]+$")
+_TEXT = ("session", "device", "user_id", "expected_username", "data", "allow_file", "files")
+_KEYS = {"role", "clients", "port", *_TEXT}
 
 
 class SettingsError(Exception):
@@ -73,7 +74,6 @@ class SettingsError(Exception):
 class Connector:
     name: str
     role: Role
-    role_name: str
     session: str = "session"            # Keychain item holding the Telegram login
     device: str = "Claude Desktop"      # name shown under Telegram → Settings → Devices
     user_id: str = "user_id"            # Keychain item holding the user's own ID (role "saved")
@@ -105,6 +105,10 @@ class Settings:
         except KeyError:
             raise SettingsError(f"unknown connector '{name}' (this install has {', '.join(self.connectors)})") from None
 
+    def serves(self, c):
+        """Whether this connector runs as a hosted HTTP server."""
+        return self.hosted and bool(c.port)
+
     def url(self, c):
         return f"http://127.0.0.1:{c.port}/mcp"
 
@@ -130,7 +134,6 @@ class Settings:
 
 
 def load(path=None):
-    """Settings for this install: settings.json when present, else the product defaults."""
     path = Path(path) if path else SETTINGS
     raw = copy.deepcopy(DEFAULTS)
     if path.exists():
@@ -149,7 +152,7 @@ def parse(raw, home=HERE):
     if hosting not in ("stdio", "http"):
         raise SettingsError(f"hosting must be 'stdio' or 'http', not {hosting!r}")
     service = raw.get("service")
-    if not isinstance(service, str) or not _ITEM.match(service):
+    if not isinstance(service, str) or not ITEM.match(service):
         raise SettingsError(f"service {service!r} is not a usable Keychain service name")
     label = raw.get("label")
     if not isinstance(label, str) or not re.fullmatch(r"[A-Za-z0-9.\-]+", label):
@@ -178,13 +181,12 @@ def _connector(name, spec, hosting, ports):
     role = spec.get("role")
     if role not in ROLES:
         bad(f"unknown role {role!r} (one of {', '.join(ROLES)})")
-    values = {k: spec[k] for k in ("session", "device", "user_id", "expected_username", "data", "allow_file", "files")
-              if k in spec}
+    values = {k: spec[k] for k in _TEXT if k in spec}
     for k, v in values.items():
         if not isinstance(v, str):
             bad(f"{k} must be text")
     for k in ("session", "user_id", "expected_username"):
-        if values.get(k) and not _ITEM.match(values[k]):
+        if values.get(k) and not ITEM.match(values[k]):
             bad(f"{k} {values[k]!r} is not a usable Keychain item name")
     if ROLES[role].chats == "one" and not values.get("allow_file"):
         bad("a one-chat connector needs allow_file")
@@ -200,7 +202,7 @@ def _connector(name, spec, hosting, ports):
         ports[port] = name
     elif hosting == "http" and clients:
         bad("hosting is on, so it needs a port")
-    return Connector(name=name, role=ROLES[role], role_name=role, clients=tuple(clients), port=port, **values)
+    return Connector(name=name, role=ROLES[role], clients=tuple(clients), port=port, **values)
 
 
 def read_ids(path, one=False):
@@ -209,9 +211,10 @@ def read_ids(path, one=False):
     Numeric only, because a username can later belong to someone else. A single
     chat (one=True) may be a group, so negative IDs are allowed there.
     """
+    path = Path(path)
     pattern = r"-?[0-9]+" if one else r"[0-9]+"
     ids = []
-    for line in Path(path).read_text().splitlines():
+    for line in path.read_text().splitlines():
         value = line.split("#", 1)[0].strip()
         if not value:
             continue
