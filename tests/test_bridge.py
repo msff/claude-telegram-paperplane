@@ -20,6 +20,8 @@ class FakeConnector(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers["Content-Length"]))
         self.server.seen.append((dict(self.headers), json.loads(body)))
+        if self.server.handle:
+            return self.server.handle(self)
         if self.headers.get("Authorization") != f"Bearer {self.server.token}":
             return self.send(401, b"unauthorized", "text/plain")
         message = json.loads(body)
@@ -45,7 +47,7 @@ class FakeConnector(BaseHTTPRequestHandler):
 
 def start_server(port=0, token=TOKEN):
     server = ThreadingHTTPServer(("127.0.0.1", port), FakeConnector)
-    server.seen, server.token = [], token
+    server.seen, server.token, server.handle = [], token, None
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
 
@@ -98,6 +100,26 @@ class RelayTest(unittest.TestCase):
         got = relay(self.port, request(1), token="wrong-token")
         self.assertIn("token", got[0]["error"]["message"])
         self.assertIn("the doctor", got[0]["error"]["message"])
+
+    def test_after_a_restart_the_new_token_is_read_and_the_message_sent_again(self):
+        got = relay(self.port, request(1), token="before-the-restart", reread=lambda: TOKEN)
+        self.assertEqual(got, [{"jsonrpc": "2.0", "id": 1, "result": {"echo": "tools/list"}}])
+        self.assertEqual(len(self.server.seen), 2)
+
+    def test_a_401_with_an_unchanged_token_is_not_sent_again(self):
+        got = relay(self.port, request(1), token="wrong-token", reread=lambda: "wrong-token")
+        self.assertIn("token", got[0]["error"]["message"])
+        self.assertEqual(len(self.server.seen), 1)
+
+    def test_a_reply_cut_off_midway_is_answered_with_an_error(self):
+        def cut_off(handler):
+            handler.send_response(200)
+            handler.send_header("Content-Length", "100")
+            handler.end_headers()
+            handler.wfile.write(b'{"jsonrpc"')
+        self.server.handle = cut_off
+        got = relay(self.port, request(1))
+        self.assertIn("dropped the connection", got[0]["error"]["message"])
 
     def test_foreign_listener_never_receives_the_token(self):
         got = relay(self.port, request(1), owned=lambda port: False)

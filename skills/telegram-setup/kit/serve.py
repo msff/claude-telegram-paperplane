@@ -23,6 +23,7 @@ helper start often and must stay light. Upstream code is never edited.
 import json
 import os
 import re
+import secrets
 import stat
 import sys
 import time
@@ -30,7 +31,7 @@ from pathlib import Path
 
 import bridge
 import connectors
-from connectors import SettingsError, kc_read
+from connectors import SettingsError, kc_read, kc_write
 
 HERE = Path(__file__).resolve().parent
 CONNECTOR = HERE / "chigwell"
@@ -174,8 +175,8 @@ def prune(server, allow):
 def register_extras(rt):
     """Register tools chigwell lacks, built only from chigwell's own helpers.
 
-    Registered before both filters run, so a connector gets one only by naming
-    it in TOOLS and ALLOW, like any upstream tool. Upstream code stays untouched.
+    Registered before both filters run, so a connector gets one only when its
+    role in connectors.py names it, like any upstream tool. Upstream code stays untouched.
     """
     from typing import Optional, Union
 
@@ -371,6 +372,18 @@ def trim_log(limit=LOG_LIMIT):
 
 def main(argv=None):
     mode, name = parse_args(sys.argv[1:] if argv is None else argv)
+    if mode != "host":
+        return launch(mode, name)
+    trim_log()
+    try:
+        launch(mode, name)
+    except Refused as e:
+        # launchd restarts a hosted server only after a failed exit. A restart cannot
+        # fix a refusal, and setup.sh starts the server again once the cause is fixed.
+        print(e.code, file=sys.stderr)
+
+
+def launch(mode, name):
     try:
         settings = connectors.load()
         if mode == "headers":
@@ -383,12 +396,13 @@ def main(argv=None):
         return bridge.run(settings, c)
     token = None
     if mode == "host":
-        trim_log()
         if not c.port:
             raise Refused(f"{name} has no port; turn hosting on first")
-        token = kc_read(settings.service, settings.token_item(c))
-        if not token:
-            raise Refused(f"{name}: no hosting token in the Keychain; run the doctor")
+        # A new token on every start: one that a client sent to whoever held the
+        # port while this server was down no longer opens anything.
+        token = secrets.token_urlsafe(32)
+        if not kc_write(settings.service, settings.token_item(c), token):
+            raise Refused(f"{name}: could not store a new hosting token in the Keychain")
     env = prepare(settings, c, "http" if token else "stdio", os.environ)
     os.environ.clear()
     os.environ.update(env)

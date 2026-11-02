@@ -58,7 +58,7 @@ Optional:
 - **No sending to people.** `tg_main` can only draft. `tg_saved` and `tg_bots` are confined to an allowlist (your own ID; the bot IDs), and the launcher refuses to start either one with an empty list, which the connector would treat as "every chat".
 - **Files go out only from `~/.claude-telegram/outbox/`.** Links pointing elsewhere are refused.
 - **Clean environment.** The launcher drops inherited `TELEGRAM_*`/`MCP_*` variables and refuses to start if a `.env` file would be loaded.
-- **Hosting stays local.** With `host on`, each connector listens on `127.0.0.1` only. It answers only requests with its own token (one per connector, in the Keychain) and refuses anything sent from a web page. The token is released only to a listener that runs as you.
+- **Hosting stays local.** With `host on`, each connector listens on `127.0.0.1` only. It answers only requests with its own token (one per connector, in the Keychain) and refuses anything sent from a web page. The token is released only to a listener that runs as you, and a new one is made each time the connector starts.
 - **Untrusted content.** Message text and bot replies are written by other people. The skills tell Claude to treat them as content, never as instructions.
 - **Logged out on removal.** Telegram lists the login as **"Claude Desktop"** under Settings → Devices; ending it there cuts Claude off at once. `uninstall` ends it for you and deletes the Keychain items.
 

@@ -49,12 +49,13 @@ def request_ids(message):
 
 class Bridge:
     def __init__(self, name, url, token, out=None, doctor="the Telegram doctor",
-                 retry=RETRY_SECONDS, owned=listener_owned):
+                 retry=RETRY_SECONDS, owned=listener_owned, reread=None):
         parts = urlsplit(url)
         if parts.scheme != "http" or parts.hostname != "127.0.0.1" or not parts.port:
             raise ValueError(f"{name}: hosted URL must be http://127.0.0.1:<port>/..., not {url!r}")
         self.name, self.port, self.path = name, parts.port, parts.path or "/"
         self.token = token
+        self.reread = reread    # reads the token again: a hosted server makes a new one each time it starts
         self.out = out if out is not None else sys.stdout.buffer
         self.doctor = doctor
         self.retry = retry
@@ -94,9 +95,34 @@ class Bridge:
             self.write(reply)
 
     def post(self, body):
-        """Send one message; the parsed reply, or None when the server accepted it without one."""
+        """Send one message; the parsed reply, or None when the server accepted it without one.
+
+        A 401 comes from the guard before the connector runs anything, so after
+        one the message goes out once more if the token has changed since.
+        """
+        if not self.token and self.reread:
+            self.token = self.reread()
         if not self.token:
             raise Unreachable("has no hosting token in the Keychain")
+        status, data = self.send(body)
+        if status == 401 and self.reread:
+            fresh = self.reread()
+            if fresh and fresh != self.token:
+                self.token = fresh
+                status, data = self.send(body)
+        if status == 401:
+            raise Unreachable("refused the token (it does not match the one in the Keychain)")
+        if status == 403:
+            raise Unreachable("refused the request")
+        if status == 202 and not data.strip():
+            return None
+        try:
+            return json.loads(data)
+        except ValueError:
+            raise Unreachable(f"sent a reply that is not JSON (HTTP {status})") from None
+
+    def send(self, body):
+        """POST once to our own listener; the HTTP status and body."""
         deadline = time.monotonic() + self.retry
         delay = 0.25
         while True:
@@ -113,7 +139,7 @@ class Bridge:
             except OSError as e:
                 conn.close()
                 raise Unreachable(f"cannot be reached ({e})") from None
-        # Never retried once sent: a repeated tool call could send a message twice.
+        # Never retried once the connector may have run it: a repeated tool call could send a message twice.
         try:
             if not self.owned(self.port):
                 raise Unreachable(f"port {self.port} is held by a process that is not yours, "
@@ -124,22 +150,13 @@ class Bridge:
             resp = conn.getresponse()
             data = resp.read()
             session = resp.getheader("mcp-session-id")
-        except OSError as e:
-            raise Unreachable(f"dropped the connection ({e})") from None
+        except (OSError, http.client.HTTPException) as e:
+            raise Unreachable(f"dropped the connection ({e!r})") from None
         finally:
             conn.close()
         if session:
             self.learned["mcp-session-id"] = session
-        if resp.status == 401:
-            raise Unreachable("refused the token (it does not match the one in the Keychain)")
-        if resp.status == 403:
-            raise Unreachable("refused the request")
-        if resp.status == 202 and not data.strip():
-            return None
-        try:
-            return json.loads(data)
-        except ValueError:
-            raise Unreachable(f"sent a reply that is not JSON (HTTP {resp.status})") from None
+        return resp.status, data
 
     def learn(self, message, reply):
         if isinstance(message, dict) and message.get("method") == "initialize" and isinstance(reply, dict):
@@ -156,6 +173,8 @@ class Bridge:
 
 def run(settings, c):
     """Relay stdin and stdout to this install's hosted copy of the connector."""
-    token = kc_read(settings.service, settings.token_item(c))
-    Bridge(c.name, settings.url(c), token,
+    def reread():
+        return kc_read(settings.service, settings.token_item(c))
+
+    Bridge(c.name, settings.url(c), reread(), reread=reread,
            doctor=f"'{settings.home}/setup.sh doctor'").run()

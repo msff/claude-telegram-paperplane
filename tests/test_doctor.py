@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -99,6 +99,19 @@ class EntriesTest(unittest.TestCase):
         self.assertFalse(tgsetup.ours({"type": "http", "url": "http://127.0.0.1:47601/mcp",
                                        "headersHelper": "/somewhere/else --headers"}))
         self.assertFalse(tgsetup.ours({"command": "/somewhere/else"}))
+
+
+class StaleAllowlistTest(unittest.TestCase):
+    def test_an_allowlist_edited_after_its_server_started_is_reported(self):
+        s = settings()
+        bots = s.home / "bots.txt"
+        bots.write_text("123\n")
+        edited = datetime.fromtimestamp(bots.stat().st_mtime)
+        tg_bots = s.connector("tg_bots")
+        self.assertTrue(tgsetup.allowlist_newer(s, tg_bots, started=lambda port: edited - timedelta(minutes=1)))
+        self.assertFalse(tgsetup.allowlist_newer(s, tg_bots, started=lambda port: edited))
+        self.assertFalse(tgsetup.allowlist_newer(s, tg_bots, started=lambda port: None))
+        self.assertFalse(tgsetup.allowlist_newer(s, s.connector("tg_main"), started=lambda port: edited))
 
 
 class DesktopStartTest(unittest.TestCase):

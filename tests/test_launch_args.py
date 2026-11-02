@@ -1,17 +1,21 @@
+import asyncio
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import textwrap
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 KIT = Path(__file__).resolve().parents[1] / "skills" / "telegram-setup" / "kit"
 sys.path.insert(0, str(KIT))
 import connectors  # noqa: E402
 import serve  # noqa: E402
+from guard import Guard  # noqa: E402
 
 SECRETS = {"api_id": "1", "api_hash": "h", "session": "s", "user_id": "42", "http/tg_main": "tok"}
 
@@ -155,7 +159,7 @@ class _MCP:
             self._tool_manager.names.add(f.__name__)
             return f
         return deco
-    def streamable_http_app(self): return None
+    def streamable_http_app(self): return "the-app"
     async def run_streamable_http_async(self): pass
 mcp = _MCP(NAMES)
 roots = []
@@ -191,7 +195,14 @@ class HandoverTest(unittest.TestCase):
         (root / "main.py").write_text(textwrap.dedent(FAKE_MAIN))
         self.root = root
         self.argv, self.path = sys.argv, list(sys.path)
-        sys.modules["uvicorn"] = types.SimpleNamespace(Config=None, Server=None)
+        self.served = []
+
+        async def record(config):
+            self.served.append(config)
+
+        sys.modules["uvicorn"] = types.SimpleNamespace(
+            Config=lambda app, **kw: types.SimpleNamespace(app=app, **kw),
+            Server=lambda config: types.SimpleNamespace(serve=lambda: record(config)))
 
     def tearDown(self):
         sys.argv, sys.path[:] = self.argv, self.path
@@ -217,11 +228,65 @@ class HandoverTest(unittest.TestCase):
         rt = self.run_serve(["tg_main"])
         self.assertEqual(rt.mcp._tool_manager.names, set(connectors.ROLES["read"].tools))
 
-    def test_hosted_start_switches_to_json_replies_and_our_http_runner(self):
+    def test_hosted_start_serves_the_guarded_app_on_loopback_only_with_json_replies(self):
         rt = self.run_serve(["tg_main", "--host"], token="tok")
         self.assertTrue(rt.mcp.settings.json_response)
-        self.assertEqual(rt.mcp.run_streamable_http_async.__name__, "run_streamable_http_async")
-        self.assertIn("run_streamable_http_async", vars(rt.mcp))
+        asyncio.run(rt.mcp.run_streamable_http_async())
+        config, = self.served
+        self.assertEqual((config.host, config.port), ("127.0.0.1", 47601))
+        self.assertIsInstance(config.app, Guard)
+        self.assertEqual((config.app.app, config.app.expected), ("the-app", b"Bearer tok"))
+
+    def test_a_connector_without_a_streamable_http_app_is_refused(self):
+        with self.assertRaises(serve.Refused):
+            serve.host_http(types.SimpleNamespace(settings=types.SimpleNamespace(json_response=False)), "tok", 47601)
+
+
+class HostedStartTest(unittest.TestCase):
+    """main() in host mode, with the Keychain, the environment and the server stubbed."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.settings = settings_in(self.tmp.name)
+        self.settings.state.mkdir()
+        self.keychain, self.started = dict(SECRETS), []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def start(self, stored=True):
+        def write(service, item, value, timeout=15):
+            if stored:
+                self.keychain[item] = value
+            return stored
+
+        err, cwd, umask = io.StringIO(), os.getcwd(), os.umask(0o022)
+        try:
+            with mock.patch.object(serve.connectors, "load", lambda: self.settings), \
+                    mock.patch.object(serve, "kc_write", write), \
+                    mock.patch.object(serve, "prepare", lambda s, c, transport, base: {"TRANSPORT": transport}), \
+                    mock.patch.object(serve, "serve", lambda allow, token, port: self.started.append((token, port))), \
+                    mock.patch.object(serve, "trim_log", lambda: None), \
+                    mock.patch.dict(os.environ), contextlib.redirect_stderr(err):
+                serve.main(["tg_main", "--host"])
+        finally:
+            os.chdir(cwd)
+            os.umask(umask)
+        return err.getvalue()
+
+    def test_every_start_stores_and_serves_a_new_token(self):
+        self.start()
+        self.start()
+        (first, port), (second, _) = self.started
+        self.assertEqual(port, 47601)
+        self.assertNotIn("tok", (first, second))
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.keychain["http/tg_main"], second)
+
+    def test_a_refusal_exits_cleanly_so_launchd_does_not_restart_it(self):
+        err = self.start(stored=False)
+        self.assertIn("could not store a new hosting token", err)
+        self.assertEqual(self.started, [])
 
 
 if __name__ == "__main__":

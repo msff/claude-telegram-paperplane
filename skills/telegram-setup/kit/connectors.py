@@ -238,3 +238,19 @@ def kc_read(service, name, timeout=15):
         return None
     value = done.stdout.rstrip("\n")
     return value if done.returncode == 0 and value else None
+
+
+def kc_write(service, name, value, timeout=15):
+    """Store one Keychain secret through /usr/bin/security; True once it reads back.
+
+    The value goes in on stdin (`security -i`), never on a command line. That
+    input is split on whitespace and quotes, so name and value must match ITEM.
+    """
+    if not (ITEM.match(name) and ITEM.match(value)):
+        return False
+    try:
+        subprocess.run([SECURITY, "-i"], capture_output=True, text=True, timeout=timeout,
+                       input=f"add-generic-password -U -s {service} -a {name} -l {service} -w {value}\n")
+    except subprocess.TimeoutExpired:
+        return False
+    return kc_read(service, name, timeout) == value
