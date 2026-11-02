@@ -1,8 +1,12 @@
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "skills" / "telegram-setup" / "kit"))
 import connectors  # noqa: E402
@@ -95,6 +99,18 @@ class EntriesTest(unittest.TestCase):
         self.assertFalse(tgsetup.ours({"type": "http", "url": "http://127.0.0.1:47601/mcp",
                                        "headersHelper": "/somewhere/else --headers"}))
         self.assertFalse(tgsetup.ours({"command": "/somewhere/else"}))
+
+
+class DesktopStartTest(unittest.TestCase):
+    def test_start_time_is_read_whatever_the_users_locale(self):
+        def ps(args, env=None, **kwargs):
+            # ps prints its dates in the locale it is given; this user's own puts the day first.
+            c = (env or os.environ).get("LC_ALL") == "C"
+            date = "Mon Nov  2 16:56:42 2026" if c else "Mon  2 Nov 16:56:42 2026"
+            return subprocess.CompletedProcess(args, 0, f"{date}     /Applications/Claude.app/Contents/MacOS/Claude\n", "")
+        with mock.patch.dict(os.environ, {"LANG": "en_GB.UTF-8", "LC_ALL": ""}), \
+                mock.patch.object(tgsetup.subprocess, "run", ps):
+            self.assertEqual(tgsetup.claude_started(), datetime(2026, 11, 2, 16, 56, 42))
 
 
 if __name__ == "__main__":

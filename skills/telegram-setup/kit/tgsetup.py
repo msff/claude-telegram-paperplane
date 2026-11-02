@@ -765,8 +765,12 @@ def headers_released(s, c):
 
 
 def claude_started():
-    """Start time of the running Claude Desktop, or None."""
-    out = subprocess.run(["ps", "-axo", "lstart=,comm="], capture_output=True, text=True).stdout
+    """Start time of the running Claude Desktop, or None.
+
+    ps prints dates in the user's locale ("Mon  2 Nov" under en_GB); the C locale gives the order strptime reads.
+    """
+    out = subprocess.run(["ps", "-axo", "lstart=,comm="], capture_output=True, text=True,
+                         env={**os.environ, "LC_ALL": "C"}).stdout
     for line in out.splitlines():
         if line.rstrip().endswith("/Claude.app/Contents/MacOS/Claude"):
             try:
