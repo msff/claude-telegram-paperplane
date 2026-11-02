@@ -772,7 +772,7 @@ async def cmd_doctor(args):
     print(f"Keychain (service \"{s.service}\")")
     items = {"api_id", "api_hash"} | {c.session for c in active} | {c.user_id for c in active if c.role.chats == "own"}
     if s.hosted:
-        items |= {s.token_item(c) for c in active if c.port}
+        items |= {s.token_item(c) for c in active if c.port and not startable(s, c)}
     gone = sorted(n for n in items if not kc_exists(n))
     ok(f"{len(items)} item(s) present") if not gone else bad(f"missing {', '.join(gone)}: run setup.sh login (tokens: setup.sh host on)")
 
