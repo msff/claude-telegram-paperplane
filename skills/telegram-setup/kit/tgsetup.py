@@ -1,34 +1,50 @@
-"""Telegram for Claude Desktop: login, bots, Desktop registration, health check.
+"""Telegram for Claude: login, bots, registration, hosting, health check.
 
 Run by setup.sh with the connector's own Python (it has Telethon and qrcode).
 Secrets go only to the login Keychain, through /usr/bin/security on stdin, so
-they never appear in a process list; nothing here prints them.
+they never appear in a process list; nothing here prints them. Which
+connectors exist, and who may load them, comes from connectors.py.
 """
 import argparse
 import asyncio
+import copy
 import getpass
+import io
 import json
 import os
+import plistlib
 import re
+import secrets
+import shlex
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
+import bridge
+import connectors
+
 HERE = Path(__file__).resolve().parent
-SERVICE = "claude-telegram"
 DEVICE = "Claude Desktop"
 DESKTOP_CONFIG = Path.home() / "Library" / "Application Support" / "Claude" / "claude_desktop_config.json"
+CODE_CONFIG = Path.home() / ".claude.json"
+CODE_SETTINGS = Path.home() / ".claude" / "settings.json"
+LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 PIN = "9760717c2bb6a5caae90267b0fc3f7e8a12c95ce"
-SECURITY = "/usr/bin/security"
+SECURITY = connectors.SECURITY
 LAUNCHER = HERE / "launch.sh"
 BOTS = HERE / "bots.txt"
 OUTBOX = HERE / "outbox"
-EXPECTED_TOOLS = {"tg_main": 14, "tg_saved": 1, "tg_bots": 6}
 SECRETS = ("api_id", "api_hash", "session", "user_id")
-_SAFE = re.compile(r"^[A-Za-z0-9_=+/.\-]+$")
+FIRST_PORT = 47601
+READY_SECONDS = 90      # a hosted server opens its port only after it reaches Telegram
+UNLOAD_TRIES = 40       # quarter seconds to wait for launchd to let go of a booted-out agent
+_INIT = {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "tg-doctor", "version": "1"}}
 
 API_HELP = """
 Telegram needs an "app" registered to your account (free, two minutes):
@@ -46,34 +62,36 @@ BOTS_HEADER = """# Bots the tg_bots connector may talk to: one numeric ID per li
 """
 
 
+@lru_cache(maxsize=None)
+def conf():
+    try:
+        return connectors.load()
+    except connectors.SettingsError as e:
+        sys.exit(f"✗ {e}")
+
+
 # ---------- Keychain ----------
 
 def kc_read(name):
-    done = subprocess.run([SECURITY, "find-generic-password", "-s", SERVICE, "-a", name, "-w"],
-                          capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
-    value = done.stdout.rstrip("\n")
-    return value if done.returncode == 0 and value else None
+    return connectors.kc_read(conf().service, name, timeout=10)
 
 
 def kc_exists(name):
     """Existence only: without -w, security prints attributes, never the secret."""
-    return subprocess.run([SECURITY, "find-generic-password", "-s", SERVICE, "-a", name],
+    return subprocess.run([SECURITY, "find-generic-password", "-s", conf().service, "-a", name],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                           stdin=subprocess.DEVNULL, timeout=10).returncode == 0
 
 
 def kc_write(name, value):
-    # `security -i` splits its input on whitespace and quotes; these values never contain either.
-    if not (_SAFE.match(name) and _SAFE.match(value)):
+    if not (connectors.ITEM.match(name) and connectors.ITEM.match(value)):
         sys.exit(f"✗ refusing to store '{name}': unexpected characters")
-    subprocess.run([SECURITY, "-i"], capture_output=True, text=True, timeout=10,
-                   input=f"add-generic-password -U -s {SERVICE} -a {name} -l {SERVICE} -w {value}\n")
-    if kc_read(name) != value:
+    if not connectors.kc_write(conf().service, name, value, timeout=10):
         sys.exit(f"✗ could not store '{name}' in the Keychain")
 
 
 def kc_delete(name):
-    subprocess.run([SECURITY, "delete-generic-password", "-s", SERVICE, "-a", name],
+    subprocess.run([SECURITY, "delete-generic-password", "-s", conf().service, "-a", name],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
 
 
@@ -198,6 +216,8 @@ async def cmd_login(args):
     if old and old != session and await end_login(old, api_id, api_hash):
         print("Ended the previous Claude Desktop login.")
     print(f"✓ Logged in to Telegram as {label(me)}. It appears as \"{DEVICE}\" under Settings → Devices.")
+    s = conf()
+    return len(restart_hosted(s, {c.name for c in s.connectors.values() if c.session == "session"}))
 
 
 def bot_ids():
@@ -251,17 +271,58 @@ async def cmd_bots(args):
         text = BOTS.read_text() if BOTS.exists() else BOTS_HEADER
         BOTS.write_text(text.rstrip("\n") + "\n" + "\n".join(added) + "\n")
         os.chmod(BOTS, 0o600)
+        # A failed restart is reported but does not stop setup.sh from registering the connector.
+        s = conf()
+        restart_hosted(s, {c.name for c in s.connectors.values() if s.allow_path(c) == BOTS})
 
 
-# ---------- Claude Desktop config ----------
+# ---------- Settings ----------
 
-def load_config():
-    if not DESKTOP_CONFIG.exists():
+def write_json(path, data, **dump):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, **dump)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def save_settings(s, raw):
+    path = s.home / "settings.json"
+    write_json(path, raw)
+    conf.cache_clear()
+    return connectors.load(path)
+
+
+def startable(s, c):
+    """Why this connector cannot start yet, or None. A confined sender needs its allowlist."""
+    path = s.allow_path(c)
+    if path is None:
+        return None
+    if not path.exists():
+        return f"{path.name} is missing"
+    try:
+        return None if connectors.read_ids(path, one=c.role.chats == "one") else f"{path.name} lists no chats"
+    except connectors.SettingsError as e:
+        return str(e)
+
+
+def wanted(s, client):
+    return [c for c in s.connectors.values() if client in c.clients and startable(s, c) is None]
+
+
+# ---------- Claude Desktop and Claude Code entries ----------
+
+def load_json(path, what):
+    if not path.exists():
         return {}
     try:
-        return json.loads(DESKTOP_CONFIG.read_text(encoding="utf-8") or "{}")
+        return json.loads(path.read_text(encoding="utf-8") or "{}")
     except ValueError:
-        sys.exit(f"✗ {DESKTOP_CONFIG} is not valid JSON; fix it (Claude → Settings → Developer → Edit Config) and run again")
+        sys.exit(f"✗ {path} is not valid JSON; fix {what} and run again")
+
+
+def load_config():
+    return load_json(DESKTOP_CONFIG, "it (Claude → Settings → Developer → Edit Config)")
 
 
 def save_config(cfg):
@@ -271,50 +332,168 @@ def save_config(cfg):
         backup = DESKTOP_CONFIG.with_name(f"{DESKTOP_CONFIG.name}.bak-{datetime.now():%Y%m%d-%H%M%S}")
         backup.write_bytes(DESKTOP_CONFIG.read_bytes())
         os.chmod(backup, 0o600)
-    fd, tmp = tempfile.mkstemp(dir=DESKTOP_CONFIG.parent, prefix=".claude_desktop_config.")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, DESKTOP_CONFIG)
+    write_json(DESKTOP_CONFIG, cfg, ensure_ascii=False)
+    stamp = desktop_stamp(conf())
+    stamp.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    stamp.touch()
+
+
+def desktop_stamp(s):
+    """Touched whenever setup.sh changes our Claude Desktop entries."""
+    return s.state / "desktop-config-changed"
+
+
+def reload_hint():
+    """When Claude Desktop loads a config change.
+
+    A running Desktop rewrites its config from the copy it loaded whenever it
+    saves a setting, which undoes the change, so it has to be quit at once.
+    """
+    if claude_started():
+        print("  ! Claude Desktop is running: quit it now (⌘Q) and reopen it. Until then it can write its old copy "
+              "of the config back over this change; the doctor tells you if it did.")
+    else:
+        print("  Open Claude Desktop to load it.")
+
+
+def code_servers():
+    """Claude Code's user-scope servers. Read only: running sessions rewrite this file, so writes go through `claude mcp`."""
+    return load_json(CODE_CONFIG, "it").get("mcpServers", {})
+
+
+def ask_rules():
+    return load_json(CODE_SETTINGS, "it").get("permissions", {}).get("ask", [])
+
+
+def desktop_entry(c):
+    return {"command": str(LAUNCHER), "args": [c.name]}
+
+
+def code_entry(s, c):
+    if s.serves(c):
+        return {"type": "http", "url": s.url(c), "headersHelper": f"{shlex.quote(str(LAUNCHER))} --headers"}
+    return {"type": "stdio", "command": str(LAUNCHER), "args": [c.name], "env": {}}
 
 
 def ours(entry):
-    return isinstance(entry, dict) and entry.get("command") == str(LAUNCHER)
+    """An entry that runs this install's launcher, whether as a stdio command or as an HTTP headers helper."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("type") == "http":
+        try:
+            return shlex.split(entry.get("headersHelper") or "")[:1] == [str(LAUNCHER)]
+        except ValueError:
+            return False
+    return entry.get("command") == str(LAUNCHER)
+
+
+def same(have, want):
+    defaults = {"type": "stdio", "env": {}}
+    return isinstance(have, dict) and all(have.get(k, defaults.get(k)) == v for k, v in want.items())
+
+
+def claude_cli():
+    found = shutil.which("claude")
+    for p in ([found] if found else []) + [str(Path.home() / ".local" / "bin" / "claude"),
+                                           str(Path.home() / ".claude" / "local" / "claude")]:
+        if p and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def claude(*args):
+    cli = claude_cli()
+    if not cli:
+        return subprocess.CompletedProcess(args, 127, "", "the claude command is not installed")
+    return subprocess.run([cli, *args], capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+
+
+def confirm(question):
+    if not sys.stdin.isatty():
+        return False
+    return input(f"{question} [y/N] ").strip().lower().startswith("y")
+
+
+def sync_code(s, names):
+    """Make Claude Code's user entries for our connectors match: `names` registered, other ones of ours removed."""
+    current = code_servers()
+    changed = []
+    for c in s.connectors.values():
+        have = current.get(c.name)
+        if c.name in names:
+            want = code_entry(s, c)
+            if same(have, want):
+                continue
+            if have is not None and not ours(have) and not confirm(
+                    f"Claude Code already has a different connector named '{c.name}'. Replace it?"):
+                print(f"  ! left Claude Code's '{c.name}' alone")
+                continue
+            if have is not None:
+                claude("mcp", "remove", c.name, "--scope", "user")
+            done = claude("mcp", "add-json", c.name, json.dumps(want), "--scope", "user")
+            if done.returncode != 0:
+                sys.exit(f"✗ Claude Code did not take '{c.name}': {(done.stderr or done.stdout).strip()[:200]}")
+            changed.append(f"{c.name} ({want['type']})")
+        elif ours(have):
+            claude("mcp", "remove", c.name, "--scope", "user")
+            changed.append(f"removed {c.name}")
+    return changed
 
 
 def cmd_register(args):
+    s = conf()
+    if args.code:
+        raw = copy.deepcopy(s.raw)
+        for spec in raw["connectors"].values():
+            clients = spec.setdefault("clients", ["desktop"])
+            if "desktop" in clients and "code" not in clients:
+                clients.append("code")
+        s = save_settings(s, raw)
     cfg = load_config()
     servers = cfg.setdefault("mcpServers", {})
-    want = {"tg_main", "tg_saved"} | ({"tg_bots"} if bot_ids() else set())
+    want = {c.name for c in wanted(s, "desktop")}
     changed = []
-    for name in EXPECTED_TOOLS:
-        entry = {"command": str(LAUNCHER), "args": [name]}
-        if name in want and servers.get(name) != entry:
-            if name in servers and not ours(servers[name]):
-                answer = input(f"Claude Desktop already has a different connector named '{name}'. Replace it? [y/N] ")
-                if not answer.strip().lower().startswith("y"):
-                    sys.exit(f"✗ left '{name}' alone; nothing changed")
-            servers[name] = entry
-            changed.append(f"added {name}")
-        elif name not in want and ours(servers.get(name)):
-            del servers[name]
-            changed.append(f"removed {name} (no bots listed)")
+    for c in s.connectors.values():
+        entry = desktop_entry(c)
+        if c.name in want and servers.get(c.name) != entry:
+            if c.name in servers and not ours(servers[c.name]):
+                if not confirm(f"Claude Desktop already has a different connector named '{c.name}'. Replace it?"):
+                    sys.exit(f"✗ left '{c.name}' alone; nothing changed")
+            servers[c.name] = entry
+            changed.append(f"added {c.name}")
+        elif c.name not in want and ours(servers.get(c.name)):
+            del servers[c.name]
+            changed.append(f"removed {c.name}")
     if changed:
         save_config(cfg)
-        print(f"✓ Claude Desktop config: {', '.join(changed)}. Quit Claude (⌘Q) and reopen it to load this.")
+        print(f"✓ Claude Desktop config: {', '.join(changed)}.")
+        reload_hint()
     else:
-        print(f"✓ Claude Desktop already lists {', '.join(n for n in EXPECTED_TOOLS if n in want)}.")
+        print(f"✓ Claude Desktop already lists {', '.join(sorted(want)) or 'nothing of ours'}.")
+    code = {c.name for c in wanted(s, "code")}
+    if code or any(ours(e) for e in code_servers().values()):
+        if not claude_cli():
+            print("  ! Claude Code is not installed here, so it was not registered")
+        else:
+            done = sync_code(s, code)
+            print(f"✓ Claude Code: {', '.join(done)}." if done else f"✓ Claude Code already lists {', '.join(sorted(code))}.")
 
 
 def cmd_unregister(args):
+    s = conf()
     cfg = load_config()
     servers = cfg.get("mcpServers", {})
-    gone = [n for n in EXPECTED_TOOLS if ours(servers.get(n))]
+    gone = [n for n in s.connectors if ours(servers.get(n))]
     for name in gone:
         del servers[name]
     if gone:
         save_config(cfg)
     print(f"✓ Removed from Claude Desktop: {', '.join(gone) or 'nothing to remove'}.")
+    if gone:
+        reload_hint()
+    if claude_cli():
+        done = sync_code(s, set())
+        print(f"✓ Removed from Claude Code: {', '.join(n.replace('removed ', '') for n in done) or 'nothing to remove'}.")
 
 
 async def cmd_logout(args):
@@ -327,17 +506,249 @@ async def cmd_logout(args):
 
 
 def cmd_forget(args):
-    for name in SECRETS:
+    s = conf()
+    for name in SECRETS + tuple(s.token_item(c) for c in s.connectors.values()):
         kc_delete(name)
-    print(f"✓ Deleted the Keychain items (service \"{SERVICE}\").")
+    print(f"✓ Deleted the Keychain items (service \"{s.service}\").")
+
+
+# ---------- Hosting: one server per connector under launchd ----------
+
+def agent_label(s, c):
+    return f"{s.label}.{c.name}"
+
+
+def agent_path(s, c):
+    return LAUNCH_AGENTS / f"{agent_label(s, c)}.plist"
+
+
+def log_path(s, c):
+    return s.state / "logs" / f"{c.name}.log"
+
+
+def agent_plist(s, c):
+    """The launchd job for one hosted connector. It holds no secret: the server reads the Keychain itself.
+
+    launchd restarts it only after a failed exit, at most once a minute. A server
+    that refuses to start (no login, an empty allowlist) exits cleanly and waits
+    for setup.sh to start it again once the cause is fixed.
+    """
+    log = str(log_path(s, c))
+    return {"Label": agent_label(s, c), "ProgramArguments": [str(LAUNCHER), c.name, "--host"],
+            "RunAtLoad": True, "KeepAlive": {"SuccessfulExit": False}, "ThrottleInterval": 60,
+            "WorkingDirectory": str(s.state), "StandardOutPath": log, "StandardErrorPath": log}
+
+
+def launchctl(*args):
+    return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True, timeout=30)
+
+
+def agent_loaded(label):
+    return launchctl("print", f"gui/{os.getuid()}/{label}").returncode == 0
+
+
+def pause():
+    time.sleep(0.25)
+
+
+def unload_agent(label):
+    """Boot the agent out and wait until launchd has let go of it.
+
+    bootout returns before the job is gone, and a bootstrap in that window
+    fails with "5: Input/output error".
+    """
+    launchctl("bootout", f"gui/{os.getuid()}/{label}")
+    for _ in range(UNLOAD_TRIES):
+        if not agent_loaded(label):
+            return True
+        pause()
+    return False
+
+
+def drop_agent(s, c):
+    unload_agent(agent_label(s, c))
+    agent_path(s, c).unlink(missing_ok=True)
+
+
+def port_free(port):
+    with socket.socket() as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_port(taken, start=FIRST_PORT):
+    for port in range(start, 65536):
+        if port not in taken and port_free(port):
+            return port
+    sys.exit(f"✗ no free port from {start} up")
+
+
+def answers(s, c, wait=READY_SECONDS):
+    """The hosted connector's initialize reply, waiting while it starts; raises bridge.Unreachable."""
+    probe = bridge.Bridge(c.name, s.url(c), kc_read(s.token_item(c)), out=io.BytesIO(), retry=wait,
+                          reread=lambda: kc_read(s.token_item(c)))
+    reply = probe.post(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": _INIT}).encode())
+    if not isinstance(reply, dict) or "result" not in reply:
+        raise bridge.Unreachable(f"answered initialize with {str(reply)[:120]}")
+    return reply
+
+
+def host_on(s, wait=READY_SECONDS):
+    """Start one agent per hosted connector. Returns the settings and the names that did not start."""
+    raw = copy.deepcopy(s.raw)
+    taken = {c.port for c in s.connectors.values() if c.port}
+    for spec in raw["connectors"].values():
+        if spec.get("clients", ["desktop"]) and not spec.get("port"):
+            spec["port"] = pick_port(taken)
+            taken.add(spec["port"])
+    raw["hosting"] = "http"
+    s = save_settings(s, raw)
+    return s, start_agents(s, [c for c in s.connectors.values() if c.clients and c.port], wait)
+
+
+def restart_hosted(s, names, wait=READY_SECONDS):
+    """With hosting on, restart these connectors so they read their allowlist and login again.
+
+    A hosted server reads both once, when it starts, and launchd keeps it
+    running across Claude restarts. Returns the names that did not start.
+    """
+    hosted = [c for c in s.connectors.values() if c.name in names and c.clients and c.port]
+    if not (s.hosted and hosted):
+        return []
+    print("Restarting the hosted connectors this affects:")
+    failed = start_agents(s, hosted, wait)
+    if failed:
+        print(f"✗ Not running: {', '.join(failed)}. Run setup.sh doctor.")
+    return failed
+
+
+def start_agents(s, hosted, wait=READY_SECONDS):
+    """(Re)start one launchd agent per connector and wait until each answers. Returns the names that did not."""
+    LAUNCH_AGENTS.mkdir(parents=True, exist_ok=True)
+    (s.state / "logs").mkdir(parents=True, exist_ok=True)
+    os.chmod(s.state / "logs", 0o700)
+    launched, failed = [], []
+    for c in hosted:
+        why = startable(s, c)
+        if why:
+            drop_agent(s, c)
+            print(f"  - {c.name} not hosted: {why}")
+            continue
+        if not kc_exists(s.token_item(c)):
+            kc_write(s.token_item(c), secrets.token_urlsafe(32))
+        agent_path(s, c).write_bytes(plistlib.dumps(agent_plist(s, c)))
+        if not unload_agent(agent_label(s, c)):
+            failed.append(c.name)
+            print(f"  ✗ {c.name}: launchd did not let go of the running agent")
+            continue
+        done = launchctl("bootstrap", f"gui/{os.getuid()}", str(agent_path(s, c)))
+        if done.returncode != 0:
+            failed.append(c.name)
+            print(f"  ✗ {c.name}: launchd refused the agent ({done.stderr.strip()[:120]})")
+            continue
+        launched.append(c)
+    for c in launched:
+        try:
+            answers(s, c, wait)
+            print(f"  ✓ {c.name} answers on 127.0.0.1:{c.port}")
+        except bridge.Unreachable as e:
+            failed.append(c.name)
+            print(f"  ✗ {c.name}: {e} (log: {log_path(s, c)})")
+    return failed
+
+
+def host_off(s, forget_tokens=False):
+    for c in s.connectors.values():
+        drop_agent(s, c)
+        if forget_tokens:
+            kc_delete(s.token_item(c))
+    raw = copy.deepcopy(s.raw)
+    raw["hosting"] = "stdio"
+    return save_settings(s, raw)
+
+
+def code_names(s):
+    """Our connectors Claude Code should list: those whose clients include it, plus any of ours it already lists."""
+    current = code_servers()
+    return {c.name for c in wanted(s, "code")} | {n for n in s.connectors if ours(current.get(n))}
+
+
+def cmd_host(args):
+    s = conf()
+    if args.action == "status":
+        print(f"Hosting is {'on' if s.hosted else 'off'} ({s.home / 'settings.json'})")
+        for c in s.connectors.values():
+            if not (c.clients and c.port):
+                continue
+            loaded = agent_loaded(agent_label(s, c))
+            owned = bridge.listener_owned(c.port)
+            print(f"  {'✓' if loaded and owned else '✗'} {c.name}: port {c.port}, agent "
+                  f"{'loaded' if loaded else 'not loaded'}, {'listening' if owned else 'not listening'}")
+        return 0
+    names = code_names(s)
+    s, failed = host_on(s) if args.action == "on" else (host_off(s, args.forget_tokens), [])
+    if names and claude_cli():
+        done = sync_code(s, names)
+        if done:
+            print(f"✓ Claude Code: {', '.join(done)}")
+    if failed:
+        print(f"✗ Not running: {', '.join(failed)}. Don't restart Claude yet: run setup.sh doctor, "
+              "or setup.sh host off to go back.")
+        return len(failed)
+    print(f"✓ Hosting is {'on' if s.hosted else 'off'}. Quit Claude Desktop (⌘Q) and reopen it to switch over.")
+    return 0
 
 
 # ---------- Health check ----------
 
-async def probe(name):
-    """Start one connector the way Claude Desktop does; return (tool count, get_me record or None)."""
+def clash_problems(s, desktop, code):
+    """Names that Claude Desktop and Claude Code define differently, which makes Code-tab tool lists flip.
+
+    Desktop passes its servers into Code-tab sessions under their plain names,
+    and Claude Code keeps one server per name. Two entries agree only when both
+    run our launcher with exactly that connector name, or Claude Code reaches
+    that connector's hosted port through our headers helper. Only our names
+    are checked.
+    """
+    problems = []
+    for name in sorted(set(desktop) & set(code)):
+        d, cc = desktop[name], code[name]
+        c = s.connectors.get(name)
+        if c is None and not (ours(d) or ours(cc)):
+            continue
+        stdio = {"command": str(LAUNCHER), "args": [name]}
+        d_ok = same(d, stdio)
+        cc_ok = same(cc, {"type": "stdio", **stdio}) or (
+            c is not None and s.serves(c) and cc.get("type") == "http" and ours(cc)
+            and cc.get("url") == s.url(c))
+        if d_ok and cc_ok:
+            continue
+        legacy = [x for x in (d, cc) if ours(x) and x.get("args", [None])[1:] != []]
+        why = "a stale split registration (it still passes desktop or cc)" if legacy else "different servers"
+        problems.append(f"{name}: Claude Desktop and Claude Code define it as {why}; "
+                        "Code-tab sessions flip between them")
+    return problems
+
+
+def missing_asks(s, code, rules):
+    """Write tools of our Claude Code connectors that would run without a prompt."""
+    missing = []
+    for c in s.connectors.values():
+        if not c.role.asks or not ours(code.get(c.name)):
+            continue
+        covered = {f"mcp__{c.name}", f"mcp__{c.name}__*"} & set(rules)
+        missing += [f"mcp__{c.name}__{t}" for t in c.role.asks
+                    if not covered and f"mcp__{c.name}__{t}" not in rules]
+    return missing
+
+
+async def probe(s, c):
+    """Start one connector the way Claude Desktop does; return (tool count, get_me record, allowlist refuses)."""
     with tempfile.TemporaryFile() as err:
-        proc = await asyncio.create_subprocess_exec(str(LAUNCHER), name, stdin=asyncio.subprocess.PIPE,
+        proc = await asyncio.create_subprocess_exec(str(LAUNCHER), c.name, stdin=asyncio.subprocess.PIPE,
                                                     stdout=asyncio.subprocess.PIPE, stderr=err)
         seq = 0
 
@@ -350,27 +761,35 @@ async def probe(name):
             proc.stdin.write((json.dumps(msg) + "\n").encode())
             await proc.stdin.drain()
             while not notify:
-                line = await asyncio.wait_for(proc.stdout.readline(), 45)
+                line = await asyncio.wait_for(proc.stdout.readline(), 120 if s.hosted else 45)
                 if not line:
                     raise RuntimeError("exited")
                 reply = json.loads(line)
                 if reply.get("id") == seq:
+                    if "error" in reply:
+                        raise RuntimeError(str(reply["error"].get("message", ""))[:200])
                     return reply
 
+        def text(reply):
+            return "".join(x.get("text", "") for x in reply.get("result", {}).get("content", []))
+
         try:
-            await call("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
-                                      "clientInfo": {"name": "tg-doctor", "version": "1"}})
+            await call("initialize", _INIT)
             await call("notifications/initialized", notify=True)
-            tools = (await call("tools/list"))["result"]["tools"]
-            me = None
-            if name == "tg_main":
-                reply = await call("tools/call", {"name": "get_me", "arguments": {}})
-                text = "".join(c.get("text", "") for c in reply.get("result", {}).get("content", []))
+            tools = {t["name"] for t in (await call("tools/list"))["result"]["tools"]}
+            me = refuses = None
+            if c.role.whoami and "get_me" in tools:
+                body = text(await call("tools/call", {"name": "get_me", "arguments": {}}))
                 try:
-                    me = json.loads(text)
+                    me = json.loads(body)
                 except ValueError:
-                    me = {"error": text[:200]}
-            return len(tools), me
+                    me = {"error": body[:200]}
+            if c.role.chats and "send_message" in tools:
+                # Chat 1 is never on an allowlist: chigwell refuses it locally, before any network call.
+                body = text(await call("tools/call", {"name": "send_message", "arguments": {
+                    "chat_id": 1, "message": "allowlist check"}}))
+                refuses = "TELEGRAM_ALLOWED_CHAT_IDS" in body
+            return tools, me, refuses
         except (RuntimeError, asyncio.TimeoutError, KeyError, ValueError) as e:
             err.seek(0)
             tail = [l for l in err.read().decode(errors="replace").splitlines() if l.strip()][-2:]
@@ -384,19 +803,56 @@ async def probe(name):
                     proc.kill()
 
 
+def headers_released(s, c):
+    """Whether the headers helper hands Claude Code a token for this connector (never printed)."""
+    env = {**os.environ, "CLAUDE_CODE_MCP_SERVER_NAME": c.name, "CLAUDE_CODE_MCP_SERVER_URL": s.url(c)}
+    done = subprocess.run([str(LAUNCHER), "--headers"], capture_output=True, text=True, env=env, timeout=30,
+                          stdin=subprocess.DEVNULL)
+    try:
+        return done.returncode == 0 and json.loads(done.stdout).get("Authorization", "").startswith("Bearer ")
+    except ValueError:
+        return False
+
+
+def ps(*args):
+    """ps output with dates in the C locale: the user's own may put the day first ("Mon  2 Nov" under en_GB)."""
+    return subprocess.run(["ps", *args], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}).stdout
+
+
+def started_at(line):
+    """The datetime at the start of a line whose first column is ps's lstart."""
+    try:
+        return datetime.strptime(" ".join(line.split()[:5]), "%a %b %d %H:%M:%S %Y")
+    except ValueError:
+        return None
+
+
 def claude_started():
     """Start time of the running Claude Desktop, or None."""
-    out = subprocess.run(["ps", "-axo", "lstart=,comm="], capture_output=True, text=True).stdout
-    for line in out.splitlines():
+    for line in ps("-axo", "lstart=,comm=").splitlines():
         if line.rstrip().endswith("/Claude.app/Contents/MacOS/Claude"):
-            try:
-                return datetime.strptime(" ".join(line.split()[:5]), "%a %b %d %H:%M:%S %Y")
-            except ValueError:
-                return None
+            return started_at(line)
     return None
 
 
+def server_started(port):
+    """Start time of this user's listener on 127.0.0.1:<port>, or None."""
+    done = subprocess.run([bridge.LSOF, "-nP", "-a", f"-iTCP@127.0.0.1:{port}", "-sTCP:LISTEN", "-u", str(os.getuid()),
+                           "-t"], capture_output=True, text=True, timeout=10, stdin=subprocess.DEVNULL)
+    pids = done.stdout.split()
+    return started_at(ps("-o", "lstart=", "-p", pids[0])) if pids else None
+
+
+def allowlist_newer(s, c, started=server_started):
+    """Whether the connector's allowlist file changed after its hosted server read it."""
+    path = s.allow_path(c)
+    began = started(c.port) if path and path.exists() else None
+    # ps gives whole seconds; the extra second keeps an edit just before the start from counting.
+    return bool(began) and datetime.fromtimestamp(path.stat().st_mtime) > began + timedelta(seconds=1)
+
+
 async def cmd_doctor(args):
+    s = conf()
     problems = 0
 
     def ok(msg):
@@ -407,59 +863,111 @@ async def cmd_doctor(args):
         problems += 1
         print(f"  ✗ {msg}")
 
-    print("Files")
+    print(f"Files ({HERE})")
     head = subprocess.run(["git", "-C", str(HERE / "chigwell"), "rev-parse", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
     ok("connector pinned at reviewed commit") if head == PIN else bad(f"connector checkout is at '{head or 'missing'}', expected {PIN[:7]}: run setup.sh again")
     venv = HERE / "chigwell" / ".venv" / "bin" / "python"
     ok("connector environment") if venv.exists() else bad("connector environment missing: run setup.sh again")
-    for f in ("launch.sh", "serve.py"):
-        ok(f) if (HERE / f).exists() else bad(f"{f} missing: run setup.sh again from the setup folder")
+    missing = [f for f in ("launch.sh", "serve.py", "bridge.py", "guard.py", "connectors.py") if not (HERE / f).exists()]
+    ok("launcher files") if not missing else bad(f"missing {', '.join(missing)}: run setup.sh again from the setup folder")
     leftovers = [p.name for p in OUTBOX.iterdir() if not p.name.startswith(".")] if OUTBOX.exists() else []
     ok("outbox empty") if not leftovers else print(f"  ! outbox still holds {len(leftovers)} file(s): delete them once sent")
 
-    print("Keychain")
-    missing = [n for n in SECRETS if not kc_exists(n)]
-    ok(f"login stored (service \"{SERVICE}\")") if not missing else bad(f"missing {', '.join(missing)}: run setup.sh login")
+    active = [c for c in s.connectors.values() if c.clients]
+    print(f"Keychain (service \"{s.service}\")")
+    items = {"api_id", "api_hash"} | {c.session for c in active} | {c.user_id for c in active if c.role.chats == "own"}
+    if s.hosted:
+        items |= {s.token_item(c) for c in active if c.port and not startable(s, c)}
+    gone = sorted(n for n in items if not kc_exists(n))
+    ok(f"{len(items)} item(s) present") if not gone else bad(f"missing {', '.join(gone)}: run setup.sh login (tokens: setup.sh host on)")
 
-    print("Bots")
-    try:
-        ids = bot_ids()
-        bad_ids = [i for i in ids if not i.isdigit()]
-        if bad_ids:
-            bad(f"bots.txt has non-numeric lines: {', '.join(bad_ids)}")
+    print("Allowlists")
+    for c in active:
+        why = startable(s, c)
+        if c.role.chats not in ("file", "one"):
+            continue
+        if why is None:
+            n = len(connectors.read_ids(s.allow_path(c), one=c.role.chats == "one"))
+            ok(f"{c.name}: {n} chat(s) in {s.allow_path(c).name}")
+        elif c.role.chats == "file" and why.endswith(("is missing", "lists no chats")):
+            print(f"  - {c.name} is off: {why} (setup.sh bots adds some)")
         else:
-            ok(f"{len(ids)} bot(s) listed") if ids else print("  - no bots listed, so tg_bots is off (setup.sh bots adds some)")
-    except OSError as e:
-        bad(f"bots.txt unreadable: {e}")
+            bad(f"{c.name}: {why}")
 
+    desktop = load_config().get("mcpServers", {})
+    code = code_servers()
     print("Claude Desktop")
-    servers = load_config().get("mcpServers", {})
-    want = ["tg_main", "tg_saved"] + (["tg_bots"] if bot_ids() else [])
-    unregistered = [n for n in want if not ours(servers.get(n))]
-    ok(f"config lists {', '.join(want)}") if not unregistered else bad(f"config is missing {', '.join(unregistered)}: run setup.sh again")
+    for c in wanted(s, "desktop"):
+        entry = desktop.get(c.name)
+        if same(entry, desktop_entry(c)):
+            ok(f"{c.name}")
+        else:
+            # Claude Desktop can write back the copy it loaded, so it must be quit before register runs.
+            why = f"still passes {entry.get('args', [])[1:]}" if ours(entry) else "is not registered as ours"
+            bad(f"{c.name} {why}: quit Claude Desktop (⌘Q), then run setup.sh register, then open it")
     started = claude_started()
+    stamp = desktop_stamp(s)
     if started is None:
         print("  - Claude Desktop is not running: open it to load the connectors")
-    elif DESKTOP_CONFIG.exists() and datetime.fromtimestamp(DESKTOP_CONFIG.stat().st_mtime) > started:
-        print("  ! the config changed after Claude Desktop started: quit it with ⌘Q and reopen, if you haven't since")
+    elif stamp.exists() and datetime.fromtimestamp(stamp.stat().st_mtime) > started:
+        print("  ! setup.sh changed these entries after Claude Desktop started: quit it with ⌘Q and reopen it")
+
+    print("Claude Code")
+    want_code = wanted(s, "code")
+    for c in want_code:
+        entry = code.get(c.name)
+        ok(f"{c.name} ({entry.get('type', 'stdio')})") if same(entry, code_entry(s, c)) else bad(
+            f"{c.name} is missing or out of date: run setup.sh register")
+    stale = [n for n in s.connectors if ours(code.get(n)) and n not in {c.name for c in want_code}]
+    for name in stale:
+        bad(f"{name} is registered but not meant for Claude Code: run setup.sh register")
+    if not want_code and not stale:
+        print("  - none of ours (setup.sh register --code adds them)")
+    clashes, unasked = clash_problems(s, desktop, code), missing_asks(s, code, ask_rules())
+    for p in clashes:
+        bad(p)
+    for tool in unasked:
+        bad(f"{tool} runs without asking: add it to permissions.ask in {CODE_SETTINGS}")
+    if not clashes and not unasked:
+        ok("Claude Desktop and Claude Code agree on every shared name; every write that must ask has its ask rule")
+
+    if s.hosted:
+        print("Hosting (one server per connector on 127.0.0.1)")
+        for c in active:
+            if not c.port or startable(s, c):
+                continue
+            if not agent_loaded(agent_label(s, c)):
+                bad(f"{c.name}: launchd agent not loaded: run setup.sh host on")
+            elif not bridge.listener_owned(c.port):
+                bad(f"{c.name}: nothing of yours listens on port {c.port} (log: {log_path(s, c)})")
+            elif "code" in c.clients and not headers_released(s, c):
+                bad(f"{c.name}: the headers helper gives Claude Code no token")
+            elif allowlist_newer(s, c):
+                bad(f"{c.name}: {s.allow_path(c).name} changed after the server started, which still uses the old "
+                    "list: run setup.sh host on")
+            else:
+                ok(f"{c.name}: port {c.port}")
 
     print("Connectors (started the way Claude Desktop starts them)")
-    for name in want:
-        try:
-            count, me = await probe(name)
-        except RuntimeError as e:
-            bad(f"{name} does not start: {e}")
+    for c in active:
+        if startable(s, c):
             continue
-        if count != EXPECTED_TOOLS[name]:
-            bad(f"{name}: {count} tools, expected {EXPECTED_TOOLS[name]}")
+        try:
+            tools, me, refuses = await probe(s, c)
+        except RuntimeError as e:
+            bad(f"{c.name} does not start: {e}")
+            continue
+        if tools != set(c.role.tools):
+            bad(f"{c.name}: {len(tools)} tools, expected {len(c.role.tools)}")
         elif me is not None and (me.get("error") or "name" not in me):
-            bad(f"{name}: started, but Telegram refused the login ({str(me.get('error', ''))[:80]}): run setup.sh login --again")
-        elif me is not None:
-            who = me["name"] + (f" (@{me['username']})" if me.get("username") else "")
-            ok(f"{name}: {count} tools, logged in as {who}")
+            bad(f"{c.name}: started, but Telegram refused the login ({str(me.get('error', ''))[:80]}): run setup.sh login --again")
+        elif refuses is False:
+            bad(f"{c.name}: its chat allowlist is not enforced")
         else:
-            ok(f"{name}: {count} tool(s)")
+            who = f", logged in as {me['name']}" + (f" (@{me['username']})" if me.get("username") else "") if me else ""
+            held = ", allowlist holds" if refuses else ""
+            ok(f"{c.name}: {len(tools)} tool(s){who}{held}")
 
     print("\nAll good." if not problems else f"\n{problems} problem(s) above.")
     return problems
@@ -473,7 +981,12 @@ def main():
     login.add_argument("--phone", action="store_true", help="log in with phone number + code instead of QR")
     bots = sub.add_parser("bots")
     bots.add_argument("names", nargs="*")
-    for name in ("register", "unregister", "logout", "forget", "doctor"):
+    register = sub.add_parser("register")
+    register.add_argument("--code", action="store_true", help="also register the connectors in Claude Code")
+    host = sub.add_parser("host")
+    host.add_argument("action", choices=("on", "off", "status"))
+    host.add_argument("--forget-tokens", action="store_true", help="with off: also delete the hosting tokens")
+    for name in ("unregister", "logout", "forget", "doctor"):
         sub.add_parser(name)
     args = parser.parse_args()
     handler = globals()[f"cmd_{args.command}"]

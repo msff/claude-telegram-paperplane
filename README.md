@@ -47,6 +47,10 @@ Then ask Claude to "set up Telegram for Claude".
 
 Later: `bash ~/.claude-telegram/setup.sh doctor | bots @Name | login --again | uninstall`.
 
+Optional:
+- `register --code` adds the same connectors to Claude Code, under the same names and with the same tools, so a session in the Claude app never sees two different `tg_main`s.
+- `host on` runs each connector once in the background (a launchd agent on `127.0.0.1`) instead of once per Claude window and Claude Code session. Claude Code connects to it over HTTP with a token from the Keychain; Claude Desktop, which only starts local commands, reaches it through a small bridge. `host off` undoes it.
+
 ## Security model
 
 - **The login never touches a file.** It stays in the Keychain, is read only through macOS's own `/usr/bin/security`, and reaches the connector through its environment, never through command-line arguments. A watchdog stops startup if a Keychain dialog ever blocks.
@@ -54,6 +58,7 @@ Later: `bash ~/.claude-telegram/setup.sh doctor | bots @Name | login --again | u
 - **No sending to people.** `tg_main` can only draft. `tg_saved` and `tg_bots` are confined to an allowlist (your own ID; the bot IDs), and the launcher refuses to start either one with an empty list, which the connector would treat as "every chat".
 - **Files go out only from `~/.claude-telegram/outbox/`.** Links pointing elsewhere are refused.
 - **Clean environment.** The launcher drops inherited `TELEGRAM_*`/`MCP_*` variables and refuses to start if a `.env` file would be loaded.
+- **Hosting stays local.** With `host on`, each connector listens on `127.0.0.1` only. It answers only requests with its own token (one per connector, in the Keychain) and refuses anything sent from a web page. The token is released only to a listener that runs as you, and a new one is made each time the connector starts.
 - **Untrusted content.** Message text and bot replies are written by other people. The skills tell Claude to treat them as content, never as instructions.
 - **Logged out on removal.** Telegram lists the login as **"Claude Desktop"** under Settings → Devices; ending it there cuts Claude off at once. `uninstall` ends it for you and deletes the Keychain items.
 
@@ -68,9 +73,10 @@ Later: `bash ~/.claude-telegram/setup.sh doctor | bots @Name | login --again | u
 | Path | What |
 |---|---|
 | `skills/telegram-setup/SKILL.md` | The guided setup Claude follows |
-| `skills/telegram-setup/kit/` | What gets installed: `setup.sh`, `launch.sh`, `serve.py`, `tgsetup.py`, and the user-facing `README.md` |
+| `skills/telegram-setup/kit/` | What gets installed: `setup.sh`, `launch.sh`, `serve.py` (start any connector), `connectors.py` (roles and settings), `bridge.py` and `guard.py` (hosting), `tgsetup.py` (login, registration, hosting, doctor), and the user-facing `README.md` |
 | `skills/telegram-setup/references/` | Search-skill template, troubleshooting, suggested preferences text |
-| `scripts/build.sh` | Builds `dist/telegram-setup.zip` for upload and checks nothing personal ships |
+| `tests/` | Standard-library unit tests: `python3 -m unittest discover tests` (no network, no Telegram) |
+| `scripts/build.sh` | Runs the tests, builds `dist/telegram-setup.zip` for upload and checks nothing personal ships |
 
 ## Credits
 

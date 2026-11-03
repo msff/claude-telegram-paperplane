@@ -26,10 +26,15 @@ Before the kit is installed, use the copy in their folder (`bash ~/Downloads/tel
 |---|---|
 | No `tg_…` tools in Claude | Claude must be quit with ⌘Q, not just closed, and reopened. Then `bash ~/.claude-telegram/setup.sh doctor`. In Claude → Settings → Developer, each `tg_…` entry shows its error. |
 | Doctor: "Keychain item … missing" / "login stored" ✗ | `bash ~/.claude-telegram/setup.sh login` |
-| Doctor: "Telegram refused the login", or the login was ended under Devices | `bash ~/.claude-telegram/setup.sh login --again` |
-| Doctor: "the config changed after Claude Desktop started" | ⌘Q and reopen Claude. Harmless if they already did. |
+| Doctor: "Telegram refused the login", or the login was ended under Devices | `bash ~/.claude-telegram/setup.sh login --again`. With hosting on, it restarts the background connectors on the new login. |
+| Doctor: "setup.sh changed these entries after Claude Desktop started" | ⌘Q and reopen Claude. |
+| Doctor: "tg_… still passes …" or "is not registered as ours", right after `register` ran | Claude Desktop was running and wrote its old copy of the config back. In Terminal: quit Claude with ⌘Q, run `bash ~/.claude-telegram/setup.sh register`, then open Claude. |
 | `tg_bots` missing | No bots listed: `bash ~/.claude-telegram/setup.sh bots @BotName`, then ⌘Q and reopen. |
+| Doctor: "bots.txt changed after the server started" (hosting on) | `bots.txt` was edited by hand while `tg_bots` ran in the background. `bash ~/.claude-telegram/setup.sh host on` restarts it with the new list. |
 | "bots.txt: '…' is not a numeric bot ID" | A line was edited by hand. Fix or delete it in `~/.claude-telegram/bots.txt` (IDs only, `# @name` after). |
+| `tg_…` tools change between turns in a Claude Code session in the Claude app (a tool vanishes, then returns) | Claude Desktop and Claude Code define a `tg_…` name differently, and the session flips between the two. The doctor names it ("Code-tab sessions flip between them"). `bash ~/.claude-telegram/setup.sh register` rewrites both entries to match; if the other entry is not from this kit, remove it from Claude Code with `claude mcp remove <name> --scope user`. |
+| Doctor: "nothing of yours listens on port …" or "launchd agent not loaded" (hosting on) | `bash ~/.claude-telegram/setup.sh host on` restarts the agents. If it still fails, read the log the doctor names, or go back with `host off` and quit and reopen Claude. |
+| Claude says a `tg_…` connector "is not running" (hosting on) | The background connector is starting or stopped. Wait half a minute and ask again; if it persists, run the doctor. |
 | `send_file` refused | The file must sit in `~/.claude-telegram/outbox/` as a real file (not an alias or link). Pass just its name. |
 | A Keychain dialog asks to allow access | Shouldn't happen: the kit reads only through macOS's own `security` tool. Click Deny, then `bash ~/.claude-telegram/setup.sh login --again` to rewrite the items. |
 | Search finds nothing in a chat they can see | Check the `chat_id` with `get_chat`. If it's a forum and topic IDs changed, refresh the topic map with `list_topics` and rebuild the search skill. |

@@ -5,6 +5,8 @@
 #   scripts/build.sh           check, then build
 #   scripts/build.sh --check   check only (run by the pre-commit hook)
 #
+# Checks: shell and Python syntax, the unit tests under tests/, and personal data.
+#
 # Generic checks: home-folder paths and Telegram chat IDs. Your own names, usernames
 # and IDs go in a file outside the repo, one extended regex per line, so the list
 # itself is never published:
@@ -21,7 +23,9 @@ python3 -c 'import ast, json, sys
 for f in sys.argv[1:]:
     text = open(f).read()
     json.loads(text) if f.endswith(".json") else ast.parse(text, f)' \
-  "$SKILL/kit/tgsetup.py" "$SKILL/kit/serve.py" .claude-plugin/plugin.json .claude-plugin/marketplace.json
+  "$SKILL"/kit/*.py .claude-plugin/plugin.json .claude-plugin/marketplace.json
+tests="$(python3 -B -m unittest discover -s tests 2>&1)" || { echo "$tests"; echo "✗ tests failed" >&2; exit 1; }
+echo "✓ tests pass ($(echo "$tests" | grep -o 'Ran [0-9]* tests'))"
 
 scan() {
   python3 - "$PRIVATE" "$@" <<'EOF'

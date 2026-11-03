@@ -30,7 +30,7 @@ What they need: a Mac with Claude Desktop, Telegram on their phone, about 10 min
 ## Phase 2: Put the kit on their Mac
 
 1. They need a folder attached to this task. If none is attached, ask them to add one; Downloads is fine.
-2. Copy this skill's `kit/` folder into it as `telegram-setup/`, e.g. `cp -R <this skill's directory>/kit "<attached folder>/telegram-setup"`. Check that it holds `setup.sh`, `launch.sh`, `serve.py`, `tgsetup.py`, `README.md`.
+2. Copy this skill's `kit/` folder into it as `telegram-setup/`, e.g. `cp -R <this skill's directory>/kit "<attached folder>/telegram-setup"`. Check that it holds every file `setup.sh` installs: `setup.sh`, `launch.sh`, `serve.py`, `bridge.py`, `guard.py`, `connectors.py`, `tgsetup.py`, plus `README.md`.
 3. Offer to explain any file before they run it. `setup.sh` is the only one they run. It installs into `~/.claude-telegram`, fetches the open-source connector chigwell/telegram-mcp pinned to one reviewed commit, and changes nothing else except three entries in Claude Desktop's config, which it backs up first.
 
 ## Phase 3: Run it in Terminal
@@ -69,7 +69,9 @@ Offer the short text in `references/preferences.md` for their personal preferenc
 ## Later requests
 
 - **Add a chat to the search**: get the current `telegram-chat-search/SKILL.md` and `references/topic-maps.md`. Read them from the installed skill if it is visible in this session, or from the folder Phase 5 wrote. Add the row, its notes and its topics the same way, rebuild the zip, and have them upload it again, replacing the old one.
-- **Add a bot**: Terminal: `bash ~/.claude-telegram/setup.sh bots @BotName` (it checks the account is a bot), then ⌘Q and reopen Claude.
+- **Add a bot**: Terminal: `bash ~/.claude-telegram/setup.sh bots @BotName` (it checks the account is a bot), then ⌘Q and reopen Claude. To remove one, delete its line in `~/.claude-telegram/bots.txt`; with hosting on, then run `bash ~/.claude-telegram/setup.sh host on` so the background `tg_bots` drops it too.
 - **Send a file to a bot**: the file must be in `~/.claude-telegram/outbox/`. In Cowork, ask them to attach that folder (in the folder picker: ⌘⇧G, paste the path). Copy the file in, send it with `tg_bots` `send_file` using just the file name, then delete the copy.
+- **Use Telegram in Claude Code too**: Terminal: `bash ~/.claude-telegram/setup.sh register --code`. Claude Code gets the same connectors under the same names, with the same tools.
+- **Several Claude windows or sessions open, Mac short on memory**: Terminal: `bash ~/.claude-telegram/setup.sh host on`, then ⌘Q and reopen Claude. Each connector then runs once in the background on 127.0.0.1, protected by a token in the Keychain that changes each time the connector starts; `host off` undoes it.
 - **Something broke**: `bash ~/.claude-telegram/setup.sh doctor`, then `references/troubleshooting.md`.
 - **Remove everything**: `bash ~/.claude-telegram/setup.sh uninstall`. It removes the Desktop entries, ends the Telegram login and deletes the Keychain items and the folder. Uploaded skills are deleted in Claude's settings.
