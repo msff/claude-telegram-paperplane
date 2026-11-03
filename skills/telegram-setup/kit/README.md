@@ -36,7 +36,7 @@ Telegram lists this login as **"Claude Desktop"** under Settings → Devices. En
 
 - **Add a bot:** `bash ~/.claude-telegram/setup.sh bots @SomeBot`, then quit and reopen Claude. Everything Claude sends a
   listed bot reaches the bot's operator without asking you first: list only bots you trust. To remove one, delete its line in `bots.txt`;
-  with hosting on, then run `setup.sh host on` so the background connector drops it too.
+  with hosting on, then run `setup.sh host restart` so the background connector drops it too.
 - **Send a file to a bot:** in Cowork, add `~/.claude-telegram/outbox` to the task's folders (in the folder picker press
   ⌘⇧G and paste the path), then ask "send report.pdf to @SomeBot". Claude copies the file into the outbox, sends it, and deletes the copy.
   In plain chat, copy the file there yourself and name it.
@@ -45,7 +45,7 @@ Telegram lists this login as **"Claude Desktop"** under Settings → Devices. En
 - **Run each connector once instead of once per window** (saves memory when several Claude windows or Claude Code
   sessions are open): `bash ~/.claude-telegram/setup.sh host on`, then quit and reopen Claude. Each connector then runs
   as one background process on this Mac, reachable only from `127.0.0.1` with a token kept in the Keychain.
-  `host status` shows them; `host off` goes back. Each one logs to `~/.local/state/claude-telegram/logs/`, and a log is
+  `host status` shows them; `host restart` starts them again; `host off` goes back. Each one logs to `~/.local/state/claude-telegram/logs/`, and a log is
   emptied when the connector starts once it passes 5 MB.
 - **Login stopped working** (doctor says so, or Claude reports a login error): `bash ~/.claude-telegram/setup.sh login --again`.
   With hosting on, it also restarts the background connectors on the new login.
@@ -53,7 +53,8 @@ Telegram lists this login as **"Claude Desktop"** under Settings → Devices. En
 - **Remove everything:** `bash ~/.claude-telegram/setup.sh uninstall`. It stops hosting, removes the Desktop and
   Claude Code entries, ends the Telegram login, deletes the Keychain items and this folder.
 
-**Updates and source:** https://github.com/msff/claude-telegram-paperplane (re-run `setup.sh` from a newer kit to update).
+**Updates and source:** https://github.com/msff/claude-telegram-paperplane (re-run `setup.sh` from a newer kit to update;
+with hosting on, it restarts the background connectors on the new code).
 
 ## Safety built in
 

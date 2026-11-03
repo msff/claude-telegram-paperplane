@@ -191,6 +191,29 @@ class HostingTest(unittest.TestCase):
         self.assertEqual(self.restart({"tg_main"}), ([], ""))
         self.assertEqual(self.mac.boots, [])
 
+    def test_host_restart_restarts_every_hosted_connector_and_changes_nothing_else(self):
+        self.host("on")
+        code = dict(self.mac.code)
+        self.mac.boots.clear()
+        self.mac.lag = 2
+        result, _ = self.host("restart")
+        self.assertEqual(result, 0)
+        self.assertEqual(sorted(self.mac.boots), sorted(self.label(n) for n in ("tg_main", "tg_saved", "tg_bots")))
+        self.assertTrue(self.settings.hosted)
+        self.assertEqual(self.mac.code, code)
+
+    def test_host_restart_with_hosting_off_does_not_turn_it_on(self):
+        self.assertEqual(self.host("restart"), (0, ""))
+        self.assertEqual(self.mac.boots, [])
+        self.assertFalse(self.settings.hosted)
+
+    def test_host_restart_fails_when_a_connector_does_not_come_back(self):
+        self.host("on")
+        self.mac.silent.add("tg_saved")
+        result, out = self.host("restart")
+        self.assertEqual(result, 1)
+        self.assertIn("tg_saved", out.split("✗ Not running", 1)[1])
+
     def test_restart_follows_the_bots_list_from_empty_to_listed_and_back(self):
         bots = self.settings.home / "bots.txt"
         bots.write_text("# none yet\n")
