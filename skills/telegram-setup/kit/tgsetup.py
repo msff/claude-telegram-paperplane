@@ -610,9 +610,9 @@ def host_on(s, wait=READY_SECONDS):
 
 
 def restart_hosted(s, names, wait=READY_SECONDS):
-    """With hosting on, restart these connectors so they read their allowlist and login again.
+    """With hosting on, restart these connectors so they load their code, allowlist and login again.
 
-    A hosted server reads both once, when it starts, and launchd keeps it
+    A hosted server loads all three once, when it starts, and launchd keeps it
     running across Claude restarts. Returns the names that did not start.
     """
     hosted = [c for c in s.connectors.values() if c.name in names and c.clients and c.port]
@@ -688,6 +688,9 @@ def cmd_host(args):
             print(f"  {'✓' if loaded and owned else '✗'} {c.name}: port {c.port}, agent "
                   f"{'loaded' if loaded else 'not loaded'}, {'listening' if owned else 'not listening'}")
         return 0
+    if args.action == "restart":
+        # setup.sh runs this after copying new code in; with hosting off it does nothing.
+        return len(restart_hosted(s, set(s.connectors)))
     names = code_names(s)
     s, failed = host_on(s) if args.action == "on" else (host_off(s, args.forget_tokens), [])
     if names and claude_cli():
@@ -945,7 +948,7 @@ async def cmd_doctor(args):
                 bad(f"{c.name}: the headers helper gives Claude Code no token")
             elif allowlist_newer(s, c):
                 bad(f"{c.name}: {s.allow_path(c).name} changed after the server started, which still uses the old "
-                    "list: run setup.sh host on")
+                    "list: run setup.sh host restart")
             else:
                 ok(f"{c.name}: port {c.port}")
 
@@ -984,7 +987,7 @@ def main():
     register = sub.add_parser("register")
     register.add_argument("--code", action="store_true", help="also register the connectors in Claude Code")
     host = sub.add_parser("host")
-    host.add_argument("action", choices=("on", "off", "status"))
+    host.add_argument("action", choices=("on", "off", "status", "restart"))
     host.add_argument("--forget-tokens", action="store_true", help="with off: also delete the hosting tokens")
     for name in ("unregister", "logout", "forget", "doctor"):
         sub.add_parser(name)

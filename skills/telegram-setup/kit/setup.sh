@@ -6,7 +6,7 @@
 #   bash setup.sh bots        add bots the tg_bots connector may talk to
 #   bash setup.sh login       check the Telegram login (--again: new login, --phone: by phone number)
 #   bash setup.sh register    add the connectors to Claude Desktop (--code: also to Claude Code)
-#   bash setup.sh host on     run each connector once on this Mac, shared by every client (off, status)
+#   bash setup.sh host on     run each connector once on this Mac, shared by every client (off, status, restart)
 #   bash setup.sh uninstall   remove everything this installed
 #   bash setup.sh deploy DIR  copy the kit and the connector into DIR, nothing else (for your own setup)
 #
@@ -69,7 +69,7 @@ case "${1:-install}" in
     step "Removed. Quit Claude (⌘Q) and reopen it."
     echo "Skills you uploaded stay in Claude's settings (Skills) until you delete them there."
     exit 0 ;;
-  *) sed -n '3,8p' "$0"; exit 1 ;;
+  *) sed -n '/^#   bash setup.sh/p' "$0"; exit 1 ;;
 esac
 
 step "1/6  Checking this Mac"
@@ -116,8 +116,11 @@ fi
 echo "✓ connector ready"
 
 if [ -n "$DEPLOY" ]; then
+  # A hosted connector keeps the code it started with until it restarts.
+  helper host restart
   step "Deployed to ${DEST/#$HOME/~}"
   echo "Nothing was logged in or registered. Check it with:  bash ${DEST/#$HOME/~}/setup.sh doctor"
+  echo "Quit Claude Desktop (⌘Q) and reopen it to load the new code."
   exit 0
 fi
 
@@ -133,6 +136,9 @@ fi
 
 step "6/6  Adding the connectors to Claude Desktop"
 helper register
+# A hosted connector keeps the code it started with until it restarts. A failure
+# shows again in the health check below.
+helper host restart || true
 
 step "Health check"
 helper doctor || true
