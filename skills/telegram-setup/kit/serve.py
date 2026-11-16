@@ -317,6 +317,110 @@ def register_extras(rt):
             )
 
 
+def replace_save_draft(rt):
+    """Replace chigwell's save_draft with one that reads the draft back before it answers.
+
+    chigwell answers "Draft saved" as soon as messages.saveDraft returns true,
+    which only means the server took the request. A Telegram app that has the
+    chat open loads the stored draft only when the chat is opened, keeps its
+    own empty input field, and writes it back (messages.saveDraft with an empty
+    text) when its window gains or loses focus or the chat is closed: the
+    draft is erased. So the tool reads the peer's draft back with
+    messages.getPeerDialogs and reports what the server holds.
+
+    FastMCP keeps the first tool registered under a name, so the upstream tool
+    is removed first. Everything Telethon comes through rt (chigwell's runtime
+    module) at call time: serve.py keeps standard-library-only imports.
+    """
+    from typing import Optional, Union
+
+    rt.mcp._tool_manager.remove_tool("save_draft")
+
+    @rt.mcp.tool(
+        annotations=rt.ToolAnnotations(
+            title="Save Draft", openWorldHint=True, destructiveHint=False, idempotentHint=True
+        )
+    )
+    @rt.with_account(readonly=False)
+    @rt.validate_id("chat_id")
+    async def save_draft(
+        chat_id: Union[int, str],
+        message: str,
+        reply_to_msg_id: Optional[int] = None,
+        no_webpage: bool = False,
+        account: str = None,
+    ) -> str:
+        """
+        Save a draft message to a chat or channel, then read it back from Telegram and
+        report whether the server holds it. The user reviews and sends it in the app.
+
+        A Telegram app that has this chat open does not load a draft that arrives
+        meanwhile, and writes its own empty input field back when its window gains or
+        loses focus or the chat is closed, which erases the draft. Ask the user to leave
+        the chat in every Telegram app before saving. If the input field is empty when
+        they open the chat, call get_drafts to see whether the draft is still there.
+
+        Args:
+            chat_id: The chat ID or username/channel to save the draft to
+            message: The draft message text ("" clears the draft)
+            reply_to_msg_id: Optional message ID to reply to
+            no_webpage: If True, disable link preview in the draft
+        """
+        try:
+            cl = rt.get_client(account)
+            await rt.ensure_connected(cl)
+            peer = await rt.resolve_input_entity(chat_id, cl)
+            reply_to = rt.types.InputReplyToMessage(reply_to_msg_id=reply_to_msg_id) if reply_to_msg_id else None
+            await cl(
+                rt.functions.messages.SaveDraftRequest(
+                    peer=peer, message=message, no_webpage=no_webpage, reply_to=reply_to
+                )
+            )
+        except Exception as e:
+            return rt.log_and_format_error("save_draft", e, chat_id=chat_id)
+
+        try:
+            found = await cl(rt.functions.messages.GetPeerDialogsRequest(peers=[peer]))
+            draft = getattr(found.dialogs[0], "draft", None) if found.dialogs else None
+        except Exception as e:
+            return (
+                f"Draft sent to chat {chat_id}, but reading it back failed ({type(e).__name__}), "
+                "so it is NOT confirmed. Check with get_drafts before telling the user it is there."
+            )
+
+        # draftMessageEmpty (and a dialog without a draft) has no text.
+        text = getattr(draft, "message", None) or ""
+        date = getattr(draft, "date", None)
+        when = date.strftime("%Y-%m-%d %H:%M:%S UTC") if date else "unknown"
+        if not message.strip():
+            if not text.strip():
+                return f"Draft cleared in chat {chat_id}; Telegram's server holds no draft for it."
+            return (
+                f"Draft NOT cleared in chat {chat_id}: the server still holds a draft "
+                f"({len(text)} characters, server time {when})."
+            )
+        if text.strip() == message.strip():
+            return (
+                f"Draft saved to chat {chat_id} and read back from Telegram's server "
+                f"({len(text)} characters, server time {when}). It shows up when the chat is "
+                "opened; a Telegram app that has this chat open now will not show it and erases "
+                "it when its window is focused, so the user should leave the chat and reopen it."
+            )
+        if not text.strip():
+            what = "found no draft"
+        else:
+            what = (
+                f"found a different draft ({len(text)} characters instead of {len(message)}, "
+                f"server time {when})"
+            )
+        return (
+            f"Draft NOT confirmed in chat {chat_id}: Telegram accepted the save, but reading it "
+            f"back {what}. Do not tell the user it is saved. Most likely another Telegram "
+            "session replaced it, such as an app that has this chat open: ask the user to leave "
+            "the chat in every Telegram app, then save again."
+        )
+
+
 def host_http(mcp, token, port):
     """Serve the connector's own streamable HTTP app behind the guard, on 127.0.0.1 only.
 
@@ -344,6 +448,7 @@ def serve(allow, token=None, port=0, connector=CONNECTOR):
     from telegram_mcp import runtime
 
     register_extras(runtime)
+    replace_save_draft(runtime)  # read the draft back; see the function
     upstream_filter = runtime._apply_exposed_tools_mode
 
     def filter_then_prune(*args, **kwargs):
